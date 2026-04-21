@@ -108,23 +108,31 @@ export class RoombaMatterbridgePlatform extends MatterbridgeDynamicPlatform {
   }
 
   /**
-   * Fill in any missing `devices[].ipAddress` by broadcasting the iRobot discovery
-   * probe on the LAN. Runs once at startup; fast (3s collection window) and
-   * silent if everything already has an IP.
+   * Discovered robots from the startup LAN probe, keyed by BLID. Retained
+   * so per-device setup can enrich `RoombaInfo.network.mac` from the probe
+   * payload — j-series firmware doesn't publish `mac` on the MQTT state
+   * stream, so the probe is the only reliable source pre-connect.
+   */
+  private discoveredRobotsByBlid: Map<string, DiscoveredRobot> = new Map();
+
+  /**
+   * Broadcast iRobot discovery probe on the LAN and cache the reply map.
+   * Runs unconditionally at startup (not just when IPs are missing) so we
+   * can harvest `mac` + `sku` metadata the MQTT state doesn't expose.
    *
-   * Matches in priority order: (1) BLID (most stable — survives iRobot-app
-   * renames), (2) `robotname` (what the owner calls the robot, usually matches
-   * the plugin's `devices[].name`).
-   *
-   * If discovery reveals an IP that DIFFERS from a configured one, we warn
-   * (DHCP moved?) but keep the configured one — explicit beats inferred.
+   * - Fills missing `devices[].ipAddress` by matching on BLID (preferred)
+   *   then `name`.
+   * - Surfaces a warning when a configured IP differs from what the robot
+   *   is currently announcing (DHCP-renumbered common cause of "suddenly
+   *   offline").
+   * - Silent when LAN discovery finds nothing AND nothing in config needed
+   *   it (e.g. cross-subnet manual setup) — to avoid needless warnings.
    */
   private async resolveIpAddresses(devices: RoombaDeviceConfig[]): Promise<void> {
-    const missing = devices.filter((d) => !d.ipAddress);
-    if (missing.length === 0) return;
+    const missing = devices.filter((d) => !d.ipAddress).length;
 
     this.log.info(
-      `Broadcasting Roomba discovery on LAN (${missing.length} device(s) missing ipAddress)…`,
+      `Broadcasting Roomba discovery on LAN (metadata harvest${missing ? ` + ${missing} missing ipAddress` : ''})…`,
     );
     let result;
     try {
@@ -133,21 +141,21 @@ export class RoombaMatterbridgePlatform extends MatterbridgeDynamicPlatform {
       this.log.warn(`Roomba auto-discovery failed: ${err}`);
       return;
     }
+    this.discoveredRobotsByBlid = result.byBlid;
     const foundCount = result.byBlid.size;
     if (foundCount === 0) {
-      this.log.warn(
-        'Roomba auto-discovery returned no robots. ' +
-          'Check that Matterbridge is on the same subnet as your Roomba(s) ' +
-          '(UDP broadcast on port 5678 must reach them). ' +
-          'Falling back to any manually-configured ipAddress values.',
-      );
+      if (missing > 0) {
+        this.log.warn(
+          'Roomba auto-discovery returned no robots. ' +
+            'Check that Matterbridge is on the same subnet as your Roomba(s) ' +
+            '(UDP broadcast on port 5678 must reach them). ' +
+            'Falling back to any manually-configured ipAddress values.',
+        );
+      }
       return;
     }
 
     for (const dev of devices) {
-      // Even for devices with a configured IP, surface a warning if discovery
-      // disagrees — a DHCP-renumbered robot is a common "suddenly offline"
-      // cause, and the warning points the user at the fix.
       const match: DiscoveredRobot | undefined =
         (dev.blid && result.byBlid.get(dev.blid)) ||
         (dev.name && result.byName.get(dev.name)) ||
@@ -157,7 +165,7 @@ export class RoombaMatterbridgePlatform extends MatterbridgeDynamicPlatform {
         dev.ipAddress = match.ipAddress;
         this.log.info(
           `Auto-discovered ipAddress=${match.ipAddress} for "${dev.name ?? match.robotname}" ` +
-            `(blid=${match.blid}, sku=${match.sku || 'unknown'})`,
+            `(blid=${match.blid}, sku=${match.sku || 'unknown'}, mac=${match.mac ?? '(not reported)'})`,
         );
       } else if (dev.ipAddress !== match.ipAddress) {
         this.log.warn(
@@ -270,6 +278,22 @@ export class RoombaMatterbridgePlatform extends MatterbridgeDynamicPlatform {
       identityInfo = await withTimeout(connection.fetchIdentity(), 8_000, 'identity fetch timeout');
       family = connection.classifyFamily();
       cleanCapabilities = identityInfo.capabilities;
+
+      // Enrich with the MAC from LAN discovery when the MQTT state didn't
+      // publish it. j-series firmware omits the top-level `mac` field from
+      // its state stream; the UDP discovery probe reply carries it reliably
+      // across every generation.
+      if (!identityInfo.network.mac) {
+        const discovered = this.discoveredRobotsByBlid.get(blid);
+        if (discovered?.mac) {
+          identityInfo.network = { ...identityInfo.network, mac: discovered.mac };
+          this.log.info(
+            `[${deviceConfig.name ?? blid}] MAC ${discovered.mac} sourced from LAN discovery ` +
+              `(MQTT state didn't publish \`mac\` — common on j-series firmware).`,
+          );
+        }
+      }
+
       this.log.info(
         `[${deviceConfig.name ?? blid}] Classified as family "${family}" (sku=${identityInfo.sku}) ` +
           `capabilities: multiPass=${cleanCapabilities.multiPass} carpetBoost=${cleanCapabilities.carpetBoost}`,

@@ -471,24 +471,80 @@ export class RoombaDevice {
       this.log.warn(`Failed to override root node identity for ${this.deviceName}: ${err}`);
     }
 
-    // Best-effort NetworkCommissioning attach on root — flips HA's "Network
-    // type" display from Ethernet to Wi-Fi (matter.js's GeneralDiagnostics
-    // reads NetworkCommissioning features to decide the default interface
-    // type) and carries the ROBOT's SSID in Networks[0] so it appears in the
-    // controller's "Matter Info" pane and Google Home device details.
+    // Best-effort NetworkCommissioning attach on root — carries the ROBOT's
+    // SSID in Networks[0] so it appears in HA's "Matter Info" pane and
+    // Google Home device details.
     //
-    // This is a best-effort attempt — matterbridge may have already started
-    // the server node by the time we reach here, in which case
-    // `behaviors.require` is a no-op (matter.js doesn't allow adding
-    // behaviors after start). If it silently fails, the user sees
-    // "Ethernet" + no SSID, which is the pre-v1.7 behavior. Logged at debug
-    // so it's findable but doesn't scare anyone.
+    // Matterbridge may have already started the server node by the time we
+    // reach here; if so, `behaviors.require` may be a no-op. Logged at debug
+    // so silent failure is findable but doesn't scare anyone.
     if (this.pendingRootOverride.robotSsid) {
       await this.attachWifiNetworkCommissioning(
         serverNode,
         this.pendingRootOverride.robotSsid,
       );
     }
+
+    // GeneralDiagnostics.NetworkInterfaces override. matter.js's
+    // `#updateNetworkList` populates this from the HOST's NICs on the
+    // `lifecycle.online` edge — which is why HA showed "Network type:
+    // Ethernet" + the bridge's MAC. We can't race that initial write, but
+    // we CAN overwrite it ~2s later with a synthetic entry carrying the
+    // Roomba's own MAC + SSID-implied type=WiFi. The NC-based default-type
+    // inference is inconsistent across matter.js minor versions; this
+    // direct override sidesteps the detection entirely.
+    if (this.pendingRootOverride.robotMac || this.pendingRootOverride.robotSsid) {
+      this.scheduleGeneralDiagnosticsOverride(serverNode);
+    }
+  }
+
+  /**
+   * Write a synthetic `GeneralDiagnostics.NetworkInterfaces` entry reflecting
+   * the Roomba's own MAC / IP / WiFi state. Scheduled to run ~2s after the
+   * initial override so matter.js's own `#updateNetworkList` (triggered on
+   * `lifecycle.online`) has already written the host's NICs — our write
+   * then supersedes it. Without the delay we lose the race.
+   */
+  private scheduleGeneralDiagnosticsOverride(serverNode: {
+    set: (state: unknown) => Promise<void>;
+  }): void {
+    const robotMac = this.pendingRootOverride?.robotMac;
+    setTimeout(async () => {
+      try {
+        // hardwareAddress expects raw bytes. Accept colon- or dash-separated
+        // hex; fall back to a placeholder when MAC isn't known (the robot's
+        // MQTT state may not have reported it by now on older firmware).
+        const macHex = (robotMac ?? '00:00:00:00:00:00').replace(/[^0-9a-fA-F]/g, '');
+        const macBytes = Buffer.from(macHex, 'hex');
+        const syntheticInterface = {
+          name: 'wlan0',
+          isOperational: true,
+          offPremiseServicesReachableIPv4: null,
+          offPremiseServicesReachableIPv6: null,
+          hardwareAddress: macBytes,
+          // We don't have the Roomba's IPs pre-populated on pendingRootOverride
+          // (they're on the RoomaInfo.network namespace which the device
+          // doesn't carry). Empty lists are valid; the important fix is the
+          // `type` + MAC. matter.js treats these as "device did not choose to
+          // report IPs per-interface" rather than "no IPs".
+          iPv4Addresses: [],
+          iPv6Addresses: [],
+          type: 1, // GeneralDiagnostics.InterfaceType.WiFi
+        };
+        await serverNode.set({
+          generalDiagnostics: { networkInterfaces: [syntheticInterface] },
+        });
+        this.log.info(
+          `Overrode GeneralDiagnostics.NetworkInterfaces with Roomba's own MAC ${robotMac ?? '(missing)'} ` +
+            `+ type=WiFi — HA's "Matter Info" will show WiFi + the robot's MAC instead of the bridge's.`,
+        );
+      } catch (err) {
+        this.log.debug(
+          `GeneralDiagnostics NetworkInterfaces override failed (${err}) — ` +
+            `HA will continue to show "Network type: Ethernet" + the bridge's MAC.`,
+        );
+      }
+    }, 2_000);
   }
 
   /**
@@ -973,17 +1029,26 @@ export class RoombaDevice {
   private flushProgress(): void {
     if (!this.endpointActive) return;
     try {
-      this.device.setAttribute(
-        'serviceArea',
-        'progress',
-        this.missionProgress.map((p) => ({
-          areaId: p.areaId,
-          status: p.status,
-          totalOperationalTime: null,
-          estimatedTime: null,
-        })),
-        this.log,
-      );
+      const value = this.missionProgress.map((p) => ({
+        areaId: p.areaId,
+        status: p.status,
+        totalOperationalTime: null,
+        estimatedTime: null,
+      }));
+      this.device.setAttribute('serviceArea', 'progress', value, this.log);
+      // Surface the current per-area status in the log so users can verify
+      // PROG at a glance without having to read the attribute from HA's
+      // developer tools. One-liner of "room N: Operating" etc.
+      if (value.length > 0) {
+        const statusName = (s: ServiceArea.OperationalStatus): string =>
+          s === ServiceArea.OperationalStatus.Pending ? 'Pending'
+            : s === ServiceArea.OperationalStatus.Operating ? 'Operating'
+              : s === ServiceArea.OperationalStatus.Skipped ? 'Skipped'
+                : 'Completed';
+        this.log.info(
+          `PROG: ${value.map((p) => `area ${p.areaId}=${statusName(p.status)}`).join(', ')}`,
+        );
+      }
     } catch (err) {
       this.log.debug(`setAttribute serviceArea.progress failed: ${err}`);
     }

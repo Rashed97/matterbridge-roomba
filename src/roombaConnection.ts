@@ -619,11 +619,23 @@ export class RoombaConnection extends EventEmitter {
     const s = this.latestState;
     const cap = (s as { cap?: Record<string, unknown> }).cap ?? {};
     const asNum = (v: unknown): number => (typeof v === 'number' ? v : 0);
+    const sku = (s.sku as string | undefined) ?? this.config.model ?? 'Roomba';
+    // j-series firmware doesn't populate `hardwareVer` in the MQTT state
+    // stream. Rather than show "unknown" in HA's Matter Info pane, derive a
+    // meaningful value from the SKU + bootloader rev (subModSwVer.mobBtl).
+    // Falls back to the SKU alone when bootloader info is missing.
+    const bootloader = (s.subModSwVer as { mobBtl?: string } | undefined)?.mobBtl;
+    const rawHwVer = s.hardwareVer as string | undefined;
+    const hardwareVer = rawHwVer && rawHwVer !== 'unknown'
+      ? rawHwVer
+      : bootloader
+        ? `${sku} (bootloader ${bootloader})`
+        : sku;
     return {
       name: s.name ?? this.config.name ?? `Roomba ${this.config.blid}`,
-      sku: (s.sku as string | undefined) ?? this.config.model ?? 'Roomba',
+      sku,
       softwareVer: (s.softwareVer as string | undefined) ?? 'unknown',
-      hardwareVer: (s.hardwareVer as string | undefined) ?? 'unknown',
+      hardwareVer,
       network: {
         mac: s.mac,
         // Roomba firmware reports SSID as a hex-encoded string (e.g.
