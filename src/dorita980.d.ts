@@ -173,5 +173,16 @@ declare module 'dorita980' {
     end(): void;
 
     getRobotState(fields: string[]): Promise<RobotState>;
+    /**
+     * Explicitly fetch the robot's Wi-Fi configuration (wlcfg + netinfo).
+     * These fields aren't in the default state stream — dorita980 blocks
+     * until the robot publishes them in response.
+     */
+    getWirelessConfig(): Promise<RobotState>;
+    /**
+     * Fetch live Wi-Fi status (wifistat + netinfo) — signal strength and
+     * current association state.
+     */
+    getWirelessStatus(): Promise<RobotState>;
   }
 }

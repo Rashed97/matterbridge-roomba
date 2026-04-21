@@ -9,6 +9,26 @@ import type { AnsiLogger } from 'matterbridge/logger';
 const ROBOT_CIPHERS = ['AES128-SHA256', 'TLS_AES_256_GCM_SHA384'];
 const CONNECT_TIMEOUT_MS = 30_000;
 
+/**
+ * Decode the Roomba's hex-encoded SSID (firmware reports UTF-8 bytes as a
+ * hex string, no length prefix). Returns the decoded text, or the original
+ * input when it doesn't look like a valid hex pair-string.
+ */
+function decodeRoombaSsid(raw: string | undefined): string | undefined {
+  if (!raw) return undefined;
+  if (!/^[0-9a-fA-F]+$/.test(raw) || raw.length % 2 !== 0) return raw;
+  try {
+    const decoded = Buffer.from(raw, 'hex').toString('utf8');
+    // Guard against all-zero / non-printable payloads. Keep the raw string
+    // if the decoded value contains control characters — Matter would
+    // reject those anyway.
+    if (!/^[\x20-\x7E\u00A0-\uFFFF]+$/.test(decoded)) return raw;
+    return decoded;
+  } catch {
+    return raw;
+  }
+}
+
 export interface RoombaRoomConfig {
   /** Matter area ID (uint32). Must be unique per device. Presented to controllers. */
   areaId: number;
@@ -579,6 +599,10 @@ export class RoombaConnection extends EventEmitter {
       ['detectedPad', (state as { detectedPad?: unknown }).detectedPad],
       ['padWetness', (state as { padWetness?: unknown }).padWetness],
       ['subModSwVer', (state as { subModSwVer?: unknown }).subModSwVer],
+      ['mac', (state as { mac?: unknown }).mac],
+      ['wlcfg', (state as { wlcfg?: unknown }).wlcfg],
+      ['netinfo', (state as { netinfo?: unknown }).netinfo],
+      ['wifistat', (state as { wifistat?: unknown }).wifistat],
     ];
     for (const [name, val] of capFields) {
       if (val === undefined) continue;
@@ -602,7 +626,12 @@ export class RoombaConnection extends EventEmitter {
       hardwareVer: (s.hardwareVer as string | undefined) ?? 'unknown',
       network: {
         mac: s.mac,
-        ssid: s.wlcfg?.ssid,
+        // Roomba firmware reports SSID as a hex-encoded string (e.g.
+        // `426C756520526162626974` for "Blue Rabbit") — straight ASCII bytes,
+        // no length prefix, no UTF-8 surprises we've ever seen. Decode here
+        // so Matter sees the human-readable name. Fall back to the raw value
+        // if decoding fails (non-hex, odd length, etc.).
+        ssid: decodeRoombaSsid(s.wlcfg?.ssid),
         bssid: s.netinfo?.bssid,
       },
       capabilities: {
@@ -755,22 +784,44 @@ export class RoombaConnection extends EventEmitter {
    * identifying fields we've accumulated. Unlike `getRobotState`, this does NOT block until
    * every requested field has been seen — some fields (e.g. `hardwareVer`) may never arrive
    * from newer models, so we take a best-effort snapshot instead.
+   *
+   * Also proactively requests `wlcfg` + `netinfo` (the vacuum's own Wi-Fi
+   * config) via dorita980's `getWirelessConfig()` — these are NOT in the
+   * default state stream, so without an explicit fetch `info.network.ssid`
+   * stays undefined and the Matter `NetworkCommissioning` wiring falls back
+   * to the host's network.
    */
   async fetchIdentity(timeoutMs = 5_000): Promise<RoombaInfo> {
     if (!this.connected) {
       throw new Error('Not connected');
     }
-    if (this.latestState.sku || this.latestState.softwareVer) {
-      return this.getInfo();
+    if (!this.latestState.sku && !this.latestState.softwareVer) {
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, timeoutMs);
+        const once = () => {
+          clearTimeout(timer);
+          resolve();
+        };
+        this.once('stateUpdate', once);
+      });
     }
-    await new Promise<void>((resolve) => {
-      const timer = setTimeout(resolve, timeoutMs);
-      const once = () => {
-        clearTimeout(timer);
-        resolve();
-      };
-      this.once('stateUpdate', once);
-    });
+
+    // Explicitly request the wireless config block. This is a separate MQTT
+    // preferences request and may take a second or two — time-box so we don't
+    // hold up startup if the robot is slow to respond, and swallow errors
+    // (older Roombas without the API just fall back to undefined SSID).
+    if (!this.latestState.wlcfg && this.robot) {
+      try {
+        const wireless = await Promise.race([
+          this.robot.getWirelessConfig(),
+          new Promise<never>((_r, reject) => setTimeout(() => reject(new Error('wireless-config timeout')), 4_000)),
+        ]);
+        this.mergeState(wireless);
+      } catch (err) {
+        this.log.debug(`getWirelessConfig failed: ${err}`);
+      }
+    }
+
     return this.getInfo();
   }
 
