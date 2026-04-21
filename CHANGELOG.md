@@ -4,6 +4,68 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.0] — 2026-04-20
+
+Focused release on controller metadata correctness + per-room progress.
+
+### Added
+
+- **Auto-IP via LAN discovery.** The plugin now broadcasts a UDP/5678
+  `irobotmcs` probe at startup and fills in each `devices[].ipAddress` from the
+  matching reply. Works on every Roomba generation (600 / 700 / 900 / i / j /
+  s / Braava m). `ipAddress` is now optional in config — set it only when
+  broadcast-discovery can't reach the robot (docker bridge networking, VLAN
+  without broadcast forwarding). A warning is logged if DHCP has moved the
+  robot vs the configured value.
+- **ServiceArea `ProgressReporting` (PROG) feature.** Matter 1.4 §1.17.4.2
+  per-area progress tracking is now enabled on the cluster server. During a
+  multi-room mission the plugin writes a `Progress[]` attribute with
+  `{areaId, status}` entries that flip Pending → Operating → Completed as the
+  sqft-heuristic advances `currentArea`. `Skipped` is marked when the user
+  taps Skip in the iRobot app. On mission-end, remaining Operating/Pending
+  areas become Completed (clean finish) or Operating → Skipped on error.
+- **Vacuum-accurate `BasicInformation` on root node.** `partNumber`,
+  `productLabel`, and `serialNumber` are now populated from the robot's SKU
+  and BLID respectively — Google Home and HA's "Matter Info" pane show these
+  in the device details where they previously displayed "Unknown".
+- **`NetworkCommissioning(WiFi)` behavior on root node.** Attached after
+  server-node creation, populated with the **Roomba's own SSID**
+  (`wlcfg.ssid` from the robot's MQTT state, not the Matterbridge host's
+  network). Flips HA's "Network type" display from "Ethernet" to "Wi-Fi" and
+  surfaces the vacuum's SSID in the Matter Info pane.
+- **Pre-run mop/water guard.** When entering Mop or VacuumThenMop mode, the
+  plugin now validates `padFaulted` / tank presence / tank level BEFORE
+  dispatching the clean command. A doomed mission is rejected up front with
+  the appropriate Matter `OperationalError`
+  (MopCleaningPadMissing / WaterTankMissing / WaterTankEmpty, §7.4.7.1
+  ErrorState 68-71) rather than the robot starting and error-ing out mid-run.
+- **`interruptOnMidMissionSelectAreas` config surface** (default `true`).
+  Reserved for v1.7.1 — the schema lands in 1.7.0 so upgraders don't have to
+  re-edit when the mid-mission `selectAreas` handling actually ships.
+- **Type definitions for robot Wi-Fi state fields** (`wlcfg`, `netinfo`,
+  `wifistat`, `mac`, `country`) in `src/dorita980.d.ts`, so future features
+  that want to surface robot network info have types to lean on.
+
+### Changed
+
+- `RoombaInfo` now includes a `network: { mac?, ssid?, bssid? }` block sourced
+  from the robot's own MQTT state. Plugin authors forking the code can use
+  these to populate additional Matter attributes.
+- Subclassed `RoboticVacuumCleaner` → `RoombaVacuumCleaner` locally to enable
+  the ServiceArea PROG feature at construction time. Matterbridge's default
+  `createDefaultServiceAreaClusterServer` registers the behavior with only the
+  `Maps` feature; we override the method in the subclass to add
+  `ProgressReporting` too. No upstream matterbridge patch needed.
+
+### Documentation
+
+- README "Limitations we've chosen not to fix" section: MAC-address in
+  `GeneralDiagnostics.NetworkInterfaces` always shows the host's (with a
+  pointer to the override approach); BridgedDeviceBasicInformation
+  StartUp/ShutDown events not wired for `serverMode: false` users.
+- Highlights list updated with auto-IP, PROG, metadata accuracy entries.
+- Quick-start config example now omits `ipAddress`.
+
 ## [1.6.0] — 2026-04-20
 
 First public npm release. Consolidates everything since 1.5.0 (never published):
@@ -151,6 +213,7 @@ workaround.
 Initial implementation. Exposes a single Roomba as a Matter RVC device with
 basic clean / pause / resume / dock commands and operational-state mapping.
 
+[1.7.0]: https://github.com/Rashed97/matterbridge-roomba/releases/tag/v1.7.0
 [1.6.0]: https://github.com/Rashed97/matterbridge-roomba/releases/tag/v1.6.0
 [1.4.0]: https://github.com/Rashed97/matterbridge-roomba/releases/tag/v1.4.0
 [1.3.0]: https://github.com/Rashed97/matterbridge-roomba/releases/tag/v1.3.0

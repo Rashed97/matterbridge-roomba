@@ -11,6 +11,7 @@ import type { AnsiLogger } from 'matterbridge/logger';
 import { RoombaConnection, type DiscoveredMap, type RoombaDeviceConfig } from './roombaConnection.js';
 import { RoombaDevice } from './roombaDevice.js';
 import { getRoombaCloudCredentials, RoombaCloudError } from './roombaCloud.js';
+import { discoverRoombas, type DiscoveredRobot } from './discovery.js';
 import { toAreaId, withTimeout } from './utils.js';
 
 interface RoomsInMissionPayload {
@@ -78,6 +79,11 @@ export class RoombaMatterbridgePlatform extends MatterbridgeDynamicPlatform {
     // devices where they're missing, and can auto-add all cloud robots if `devices` is empty.
     await this.resolveCloudCredentials(devices);
 
+    // Auto-IP: broadcast-discover any Roombas on the LAN and fill in missing
+    // `ipAddress` fields. Happens AFTER cloud onboarding so we can match on BLID
+    // (which the cloud lookup resolves first) as well as on name.
+    await this.resolveIpAddresses(devices);
+
     for (const deviceConfig of devices) {
       if (!deviceConfig.blid || !deviceConfig.password) {
         this.log.error(
@@ -87,7 +93,9 @@ export class RoombaMatterbridgePlatform extends MatterbridgeDynamicPlatform {
       }
       if (!deviceConfig.ipAddress) {
         this.log.error(
-          `Device "${deviceConfig.name ?? deviceConfig.blid}" is missing ipAddress. Configure the robot's LAN IP. Skipping.`,
+          `Device "${deviceConfig.name ?? deviceConfig.blid}" has no ipAddress and LAN discovery didn't find it. ` +
+            `Check that the robot is powered on and on the same subnet as Matterbridge (UDP/5678). ` +
+            `As a fallback, set ipAddress manually in the config.`,
         );
         continue;
       }
@@ -95,6 +103,68 @@ export class RoombaMatterbridgePlatform extends MatterbridgeDynamicPlatform {
         await this.setupDevice(deviceConfig);
       } catch (err) {
         this.log.error(`Failed to set up Roomba ${deviceConfig.blid}: ${err}`);
+      }
+    }
+  }
+
+  /**
+   * Fill in any missing `devices[].ipAddress` by broadcasting the iRobot discovery
+   * probe on the LAN. Runs once at startup; fast (3s collection window) and
+   * silent if everything already has an IP.
+   *
+   * Matches in priority order: (1) BLID (most stable — survives iRobot-app
+   * renames), (2) `robotname` (what the owner calls the robot, usually matches
+   * the plugin's `devices[].name`).
+   *
+   * If discovery reveals an IP that DIFFERS from a configured one, we warn
+   * (DHCP moved?) but keep the configured one — explicit beats inferred.
+   */
+  private async resolveIpAddresses(devices: RoombaDeviceConfig[]): Promise<void> {
+    const missing = devices.filter((d) => !d.ipAddress);
+    if (missing.length === 0) return;
+
+    this.log.info(
+      `Broadcasting Roomba discovery on LAN (${missing.length} device(s) missing ipAddress)…`,
+    );
+    let result;
+    try {
+      result = await discoverRoombas(3_000, this.log);
+    } catch (err) {
+      this.log.warn(`Roomba auto-discovery failed: ${err}`);
+      return;
+    }
+    const foundCount = result.byBlid.size;
+    if (foundCount === 0) {
+      this.log.warn(
+        'Roomba auto-discovery returned no robots. ' +
+          'Check that Matterbridge is on the same subnet as your Roomba(s) ' +
+          '(UDP broadcast on port 5678 must reach them). ' +
+          'Falling back to any manually-configured ipAddress values.',
+      );
+      return;
+    }
+
+    for (const dev of devices) {
+      // Even for devices with a configured IP, surface a warning if discovery
+      // disagrees — a DHCP-renumbered robot is a common "suddenly offline"
+      // cause, and the warning points the user at the fix.
+      const match: DiscoveredRobot | undefined =
+        (dev.blid && result.byBlid.get(dev.blid)) ||
+        (dev.name && result.byName.get(dev.name)) ||
+        undefined;
+      if (!match) continue;
+      if (!dev.ipAddress) {
+        dev.ipAddress = match.ipAddress;
+        this.log.info(
+          `Auto-discovered ipAddress=${match.ipAddress} for "${dev.name ?? match.robotname}" ` +
+            `(blid=${match.blid}, sku=${match.sku || 'unknown'})`,
+        );
+      } else if (dev.ipAddress !== match.ipAddress) {
+        this.log.warn(
+          `Configured ipAddress (${dev.ipAddress}) for "${dev.name ?? match.robotname}" ` +
+            `differs from the address the robot is currently announcing (${match.ipAddress}). ` +
+            `If the robot is unreachable, update the config or remove ipAddress to auto-track DHCP changes.`,
+        );
       }
     }
   }
@@ -187,6 +257,7 @@ export class RoombaMatterbridgePlatform extends MatterbridgeDynamicPlatform {
       sku: deviceConfig.model ?? 'Roomba',
       softwareVer: 'unknown',
       hardwareVer: 'unknown',
+      network: {} as { mac?: string; ssid?: string; bssid?: string },
       capabilities: { multiPass: false, carpetBoost: false },
     };
     let family: 'vacuum' | 'swappable' | 'combo' | 'mop' | 'unknown' = 'unknown';

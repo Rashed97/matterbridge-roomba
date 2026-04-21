@@ -71,7 +71,39 @@ declare module 'dorita980' {
       disp?: number;
       reusable?: number;
     };
-    tankLvl?: number;
+    /**
+     * The robot's own IP-level network state. DHCP config + the BSSID of the
+     * Wi-Fi access point it's associated with. Reported verbatim by every j/i/s
+     * series firmware we've tested.
+     */
+    netinfo?: {
+      dhcp?: boolean;
+      /** IPv4 address as a uint32 (network byte order). */
+      addr?: number;
+      mask?: number;
+      gw?: number;
+      dns1?: number;
+      dns2?: number;
+      /** BSSID (AP MAC) colon-separated hex. */
+      bssid?: string;
+      sec?: number;
+    };
+    /** Current Wi-Fi config: the SSID the robot is joined to, plus security mode. */
+    wlcfg?: {
+      sec?: number;
+      /** SSID the robot is currently associated with. */
+      ssid?: string;
+    };
+    /** Wi-Fi signal / cloud-reachability snapshot. `wifi` is a 0-4-ish bar level. */
+    wifistat?: {
+      wifi?: number;
+      uap?: boolean;
+      cloud?: number;
+    };
+    /** Robot's own MAC address. Colon-separated hex. */
+    mac?: string;
+    /** ISO-2 country code the owner registered the robot in. */
+    country?: string;
     lastCommand?: {
       command: string;
       initiator: string;

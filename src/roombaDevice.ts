@@ -4,11 +4,54 @@
  */
 
 import { RoboticVacuumCleaner } from 'matterbridge/devices';
+import { MatterbridgeServiceAreaServer } from 'matterbridge';
 import { RvcRunMode, RvcCleanMode, RvcOperationalState, ServiceArea } from 'matterbridge/matter/clusters';
 import type { AnsiLogger } from 'matterbridge/logger';
 import type { RoombaConnection, RoombaInfo, RoombaStatus, RoombaRoomConfig, RoombaMapConfig } from './roombaConnection.js';
 import { buildSupportedAreas, buildSupportedMaps } from './serviceAreaBuilder.js';
 import type { RoombaFamily } from './roombaConnection.js';
+
+/**
+ * Subclass of matterbridge's RoboticVacuumCleaner that enables the
+ * Matter 1.4 ServiceArea `ProgressReporting` feature on the cluster, which
+ * matterbridge's default wiring doesn't turn on. PROG lets us emit a
+ * per-area Pending/Operating/Skipped/Completed status — the primary signal
+ * Apple Home / Google Home consume for the "currently cleaning: Living Room"
+ * progress display during a multi-room mission.
+ *
+ * We override `createDefaultServiceAreaClusterServer` (the method the parent
+ * constructor invokes at line 91 of `roboticVacuumCleaner.ts`) so the behavior
+ * gets registered with both the `Maps` and `ProgressReporting` features
+ * enabled from the start. Re-wiring the behavior AFTER construction doesn't
+ * work — matter.js treats behaviors as unique-per-cluster and `require()` is
+ * a no-op if the cluster is already installed.
+ */
+class RoombaVacuumCleaner extends RoboticVacuumCleaner {
+  override createDefaultServiceAreaClusterServer(
+    supportedAreas?: ServiceArea.Area[],
+    selectedAreas?: number[],
+    currentArea?: number | null,
+    supportedMaps?: ServiceArea.Map[],
+  ): this {
+    this.behaviors.require(
+      MatterbridgeServiceAreaServer.with(
+        ServiceArea.Feature.Maps,
+        ServiceArea.Feature.ProgressReporting,
+      ),
+      {
+        supportedAreas: supportedAreas ?? [],
+        selectedAreas: selectedAreas ?? [],
+        currentArea: currentArea !== undefined ? currentArea : null,
+        supportedMaps: supportedMaps ?? [],
+        estimatedEndTime: null,
+        // PROG initial state — empty until a mission starts. Matter spec
+        // §1.17.6.5 requires this to be non-null when the feature is enabled.
+        progress: [],
+      },
+    );
+    return this;
+  }
+}
 import {
   RUN_MODE_IDLE,
   RUN_MODE_CLEANING,
@@ -157,6 +200,21 @@ const SUPPORTED_OP_STATES: RvcOperationalState.OperationalStateStruct[] = [
 
 export class RoombaDevice {
   public readonly device: RoboticVacuumCleaner;
+  /**
+   * Per-area mission progress (Matter ServiceArea PROG feature). Maintained
+   * alongside `currentArea` — kept in sync with selectedAreas and flushed to
+   * the `progress` attribute on every transition. Written to Matter as a
+   * `ProgressStruct[]` where each entry is `{areaId, status}`.
+   *
+   * State machine per entry:
+   *   - Pending: selected but the robot hasn't reached it yet.
+   *   - Operating: robot is currently in this area (matches `currentArea`).
+   *   - Completed: robot has moved past the area (sqft-advance heuristic, or
+   *     mission end with no error).
+   *   - Skipped: iRobot-app "Skip this room" fired, mission errored partway
+   *     through, or user cancelled while the area was pending.
+   */
+  private missionProgress: Array<{ areaId: number; status: ServiceArea.OperationalStatus }> = [];
   private endpointActive = false;
   private readonly deviceName: string;
   private readonly serialNumber: string;
@@ -230,7 +288,7 @@ export class RoombaDevice {
     // RVC in Apple Home / Google Home). 'matter'/undefined = bridged under the aggregator.
     const mode: 'server' | 'matter' | undefined = serverMode ? 'server' : undefined;
 
-    this.device = new RoboticVacuumCleaner(
+    this.device = new RoombaVacuumCleaner(
       this.deviceName,
       serialNumber,
       mode,
@@ -325,6 +383,18 @@ export class RoombaDevice {
         softwareVersionString: info.softwareVer,
         hardwareVersion: hwNum,
         hardwareVersionString: info.hardwareVer,
+        // Extra BasicInformation fields — these surface in HA's "Matter Info"
+        // pane and Google Home device details; without them Google Home shows
+        // "Hardware version: Unknown" even with hardwareVersionString set.
+        partNumber: info.sku,
+        productLabel: model,
+        serialNumber: this.serialNumber,
+        // Vacuum's own network details (MAC + SSID). Used to populate
+        // NetworkCommissioning.Networks[] with the ROBOT's Wi-Fi, not the
+        // Matterbridge host's — which is what HA's "Matter Info" actually
+        // wants to show.
+        robotMac: info.network.mac,
+        robotSsid: info.network.ssid,
       };
     } catch (err) {
       this.log.warn(`Failed to apply device identity: ${err}`);
@@ -338,6 +408,11 @@ export class RoombaDevice {
     softwareVersionString: string;
     hardwareVersion: number;
     hardwareVersionString: string;
+    partNumber?: string;
+    productLabel?: string;
+    serialNumber?: string;
+    robotMac?: string;
+    robotSsid?: string;
   };
 
   /**
@@ -355,30 +430,111 @@ export class RoombaDevice {
     if (!this.serverMode || !this.pendingRootOverride) return;
     // `serverNode` is attached by matterbridge in createDeviceServerNode — it's a
     // matter.js ServerNode whose endpoint-0 `basicInformation` we need to patch.
-    const serverNode = (this.device as unknown as { serverNode?: { set: (state: unknown) => Promise<void> } }).serverNode;
+    const serverNode = (this.device as unknown as { serverNode?: {
+      set: (state: unknown) => Promise<void>;
+      behaviors?: { require: (type: unknown, init: unknown) => void; has?: (type: unknown) => boolean };
+    } }).serverNode;
     if (!serverNode || typeof serverNode.set !== 'function') {
       this.log.debug(`Server node not available yet for ${this.deviceName} — skipping root identity override`);
       return;
     }
+
+    // Build the basicInformation patch. `partNumber` / `productLabel` /
+    // `serialNumber` are optional-fixed in Matter §11.1.5 — Google Home and
+    // HA's "Matter Info" pane both pull `hardwareVersionString` for the
+    // "Hardware version" row, but HA surfaces `partNumber` and `serialNumber`
+    // in the attribute list too, and some third-party controllers use
+    // `productLabel` as a fallback display name.
+    const basicInformation: Record<string, unknown> = {
+      vendorName: this.pendingRootOverride.vendorName.slice(0, 32),
+      productName: this.pendingRootOverride.productName.slice(0, 32),
+      softwareVersion: this.pendingRootOverride.softwareVersion,
+      softwareVersionString: this.pendingRootOverride.softwareVersionString.slice(0, 64),
+      hardwareVersion: this.pendingRootOverride.hardwareVersion,
+      hardwareVersionString: this.pendingRootOverride.hardwareVersionString.slice(0, 64),
+    };
+    if (this.pendingRootOverride.partNumber) basicInformation.partNumber = this.pendingRootOverride.partNumber.slice(0, 32);
+    if (this.pendingRootOverride.productLabel) basicInformation.productLabel = this.pendingRootOverride.productLabel.slice(0, 64);
+    if (this.pendingRootOverride.serialNumber) basicInformation.serialNumber = this.pendingRootOverride.serialNumber.slice(0, 32);
+
     try {
-      await serverNode.set({
-        basicInformation: {
-          vendorName: this.pendingRootOverride.vendorName.slice(0, 32),
-          productName: this.pendingRootOverride.productName.slice(0, 32),
-          softwareVersion: this.pendingRootOverride.softwareVersion,
-          softwareVersionString: this.pendingRootOverride.softwareVersionString.slice(0, 64),
-          hardwareVersion: this.pendingRootOverride.hardwareVersion,
-          hardwareVersionString: this.pendingRootOverride.hardwareVersionString.slice(0, 64),
-        },
-      });
+      await serverNode.set({ basicInformation });
       this.log.info(
         `Root node identity overridden for ${this.deviceName}: ` +
           `vendorName=${this.pendingRootOverride.vendorName} ` +
           `productName=${this.pendingRootOverride.productName} ` +
-          `softwareVersionString=${this.pendingRootOverride.softwareVersionString}`,
+          `softwareVersionString=${this.pendingRootOverride.softwareVersionString}` +
+          (this.pendingRootOverride.partNumber ? ` partNumber=${this.pendingRootOverride.partNumber}` : '') +
+          (this.pendingRootOverride.serialNumber ? ` serialNumber=${this.pendingRootOverride.serialNumber}` : ''),
       );
     } catch (err) {
       this.log.warn(`Failed to override root node identity for ${this.deviceName}: ${err}`);
+    }
+
+    // Best-effort NetworkCommissioning attach on root — flips HA's "Network
+    // type" display from Ethernet to Wi-Fi (matter.js's GeneralDiagnostics
+    // reads NetworkCommissioning features to decide the default interface
+    // type) and carries the ROBOT's SSID in Networks[0] so it appears in the
+    // controller's "Matter Info" pane and Google Home device details.
+    //
+    // This is a best-effort attempt — matterbridge may have already started
+    // the server node by the time we reach here, in which case
+    // `behaviors.require` is a no-op (matter.js doesn't allow adding
+    // behaviors after start). If it silently fails, the user sees
+    // "Ethernet" + no SSID, which is the pre-v1.7 behavior. Logged at debug
+    // so it's findable but doesn't scare anyone.
+    if (this.pendingRootOverride.robotSsid) {
+      await this.attachWifiNetworkCommissioning(
+        serverNode,
+        this.pendingRootOverride.robotSsid,
+      );
+    }
+  }
+
+  /**
+   * Attach a WiFi-featured NetworkCommissioning behavior to the root endpoint
+   * so HA / Google Home show the Roomba's Wi-Fi SSID and network type.
+   * Dynamic import to keep the behavior class out of the plugin's main chunk
+   * when unused (e.g. bridged-mode users), and to gracefully handle matter.js
+   * versions where the import shape differs.
+   */
+  private async attachWifiNetworkCommissioning(
+    serverNode: {
+      set: (state: unknown) => Promise<void>;
+      behaviors?: { require: (type: unknown, init: unknown) => void; has?: (type: unknown) => boolean };
+    },
+    ssid: string,
+  ): Promise<void> {
+    try {
+      // matterbridge re-exports every @matter/node behavior from its
+      // `matter/behaviors` barrel; we dynamic-import so the plugin still
+      // loads on any matterbridge minor that happens to drop the symbol.
+      const { NetworkCommissioningServer } = await import('matterbridge/matter/behaviors');
+      const { NetworkCommissioning } = await import('matterbridge/matter/clusters');
+      const WifiNC = (NetworkCommissioningServer as unknown as {
+        with: (...features: unknown[]) => unknown;
+      }).with(NetworkCommissioning.Feature.WiFiNetworkInterface);
+      const ssidBytes = Buffer.from(ssid.slice(0, 32), 'utf8');
+      serverNode.behaviors?.require(WifiNC, {
+        maxNetworks: 1,
+        interfaceEnabled: true,
+        lastNetworkingStatus: NetworkCommissioning.NetworkCommissioningStatus.Success,
+        lastNetworkId: ssidBytes,
+        lastConnectErrorValue: null,
+        networks: [{ networkId: ssidBytes, connected: true }],
+        scanMaxTimeSeconds: 10,
+        connectMaxTimeSeconds: 30,
+        supportedWiFiBands: [NetworkCommissioning.WiFiBand['2G4']],
+      });
+      this.log.info(
+        `Attached NetworkCommissioning(WiFi) to root with SSID "${ssid}" — ` +
+          `Matter controllers now see the vacuum's own Wi-Fi, not the bridge's.`,
+      );
+    } catch (err) {
+      this.log.debug(
+        `NetworkCommissioning attach failed (${err}) — "Network type: Ethernet" ` +
+          `/ missing SSID in Matter Info will persist. See README known limitations.`,
+      );
     }
   }
 
@@ -572,6 +728,47 @@ export class RoombaDevice {
   }
 
   /**
+   * For mop-involving clean modes (Mop, VacuumThenMop), sanity-check the
+   * robot's tank/pad state BEFORE we dispatch the command. Returns the Matter
+   * errorStateId + human-readable statusText when the mission would fail, or
+   * null when we're good to go. Vacuum-only modes always return null.
+   */
+  private preRunMopGuard(mode: number): { errorStateId: number; statusText: string } | null {
+    const isMopMode = mode === CLEAN_MODE_MOP;
+    const isComboMode = mode === CLEAN_MODE_VACUUM_THEN_MOP;
+    if (!isMopMode && !isComboMode) return null;
+    const status = this.connection.getStatus();
+    const tool = status.installedTool;
+
+    // Swappable robots need the mop reservoir swapped in before a mop mission.
+    // Already enforced by validateCleanMode; double-check for combo/mop
+    // families below.
+    if (tool.padFaulted) {
+      return {
+        errorStateId: RvcOperationalState.ErrorState.MopCleaningPadMissing,
+        statusText: 'Mop cleaning pad is missing or unreadable. Reseat the pad before starting.',
+      };
+    }
+    // Combo / mop-only robots: tank must be present on the robot.
+    if ((this.family === 'combo' || this.family === 'mop') && tool.mopInstalled === false) {
+      return {
+        errorStateId: RvcOperationalState.ErrorState.WaterTankMissing,
+        statusText: 'Water tank is not installed. Attach the tank and retry.',
+      };
+    }
+    // Tank installed but empty. Only check when the robot has actually
+    // reported a non-zero level at some point this session (robotHasSeenTank
+    // gate) — without that, a vacuum-only robot would trip this every time.
+    if (this.robotHasSeenTank && status.tankLevel === 0) {
+      return {
+        errorStateId: RvcOperationalState.ErrorState.WaterTankEmpty,
+        statusText: 'Water tank is empty. Refill and retry.',
+      };
+    }
+    return null;
+  }
+
+  /**
    * Decide between a whole-home and a room-targeted clean based on the current
    * `selectedAreas`. Called when the controller transitions RvcRunMode -> Cleaning.
    */
@@ -587,6 +784,30 @@ export class RoombaDevice {
           `Cannot start clean: selected clean mode ${this.pendingCleanMode} is unavailable — ${denial.statusText}`,
         );
         throw new Error(denial.statusText);
+      }
+
+      // Pre-run mop/water guard (Matter 1.4 §7.4.7.1 ErrorStateEnum 68-71).
+      // For any mop-involving mode on a combo or mop-only robot, surface
+      // MopCleaningPadMissing / WaterTankMissing / WaterTankEmpty as an
+      // OperationalError + event BEFORE dispatching the clean — so the
+      // controller shows a meaningful reason and the robot never starts a
+      // doomed mission. Roomba firmware itself will raise these eventually
+      // mid-run but by then the user is confused.
+      const mopGuard = this.preRunMopGuard(this.pendingCleanMode);
+      if (mopGuard) {
+        this.log.error(
+          `Cannot start mop/combo clean: ${mopGuard.statusText} (Matter errorStateId=${mopGuard.errorStateId})`,
+        );
+        // Surface the error state + event before throwing so Apple Home
+        // shows the right icon/notification rather than a generic failure.
+        try {
+          const payload = { errorStateId: mopGuard.errorStateId, errorStateLabel: mopGuard.statusText };
+          this.device.setAttribute('rvcOperationalState', 'operationalError', payload, this.log);
+          await this.device.triggerEvent('rvcOperationalState', 'operationalError', payload, this.log);
+        } catch (err) {
+          this.log.debug(`Pre-run mop-guard error surfacing failed: ${err}`);
+        }
+        throw new Error(mopGuard.statusText);
       }
       // Apply the Roomba-side cleaning preset (carpet boost + passes) that
       // matches the selected Matter mode. The robot remembers these
@@ -606,6 +827,9 @@ export class RoombaDevice {
       // Whole-home clean: clear any stale per-area state from a previous room mission.
       this.log.info('Starting whole-home clean (no areas selected)');
       this.setCurrentArea(null);
+      // No per-area progress to report on an unconstrained mission.
+      this.missionProgress = [];
+      this.flushProgress();
       await this.connection.clean();
       return;
     }
@@ -687,6 +911,9 @@ export class RoombaDevice {
     this.missionStartSqft = startStatus.missionSqft;
     this.missionMaxIndex = 0;
     this.setCurrentArea(this.selectedAreas[0]);
+    // Seed PROG: first area Operating, rest Pending. Flushed to Matter in
+    // one write so subscribers see the whole mission picture at mission start.
+    this.initMissionProgress(this.selectedAreas);
     await this.connection.cleanRoom(missionPmapId, missionUserPmapvId, regions);
   }
 
@@ -730,7 +957,124 @@ export class RoombaDevice {
         `Advancing currentArea to ${targetArea} (room ${index + 1}/${totalRooms}, ${signal})`,
       );
       this.setCurrentArea(targetArea);
+      // PROG: flip rooms before `targetArea` to Completed, `targetArea` to
+      // Operating. Preserves any Skipped markers the app-skip handler set.
+      this.advanceProgressTo(targetArea);
     }
+  }
+
+  /**
+   * Push the `missionProgress` array to Matter's `ServiceArea.progress`
+   * attribute. Swallows errors — on a matterbridge build that doesn't ship
+   * the PROG feature-enabled behavior (our `RoombaVacuumCleaner` subclass
+   * sets it, but older upstream builds didn't), the attribute doesn't exist
+   * and the write is a silent no-op.
+   */
+  private flushProgress(): void {
+    if (!this.endpointActive) return;
+    try {
+      this.device.setAttribute(
+        'serviceArea',
+        'progress',
+        this.missionProgress.map((p) => ({
+          areaId: p.areaId,
+          status: p.status,
+          totalOperationalTime: null,
+          estimatedTime: null,
+        })),
+        this.log,
+      );
+    } catch (err) {
+      this.log.debug(`setAttribute serviceArea.progress failed: ${err}`);
+    }
+  }
+
+  /**
+   * Initialize the progress array when a mission starts. Every selected area
+   * gets `Pending` except the first, which is marked `Operating`.
+   */
+  private initMissionProgress(areaIds: readonly number[]): void {
+    this.missionProgress = areaIds.map((areaId, i) => ({
+      areaId,
+      status: i === 0 ? ServiceArea.OperationalStatus.Operating : ServiceArea.OperationalStatus.Pending,
+    }));
+    this.flushProgress();
+  }
+
+  /**
+   * Mark a specific area's progress state. Idempotent; no-op if the entry
+   * already has the requested status.
+   */
+  private setAreaProgress(areaId: number, status: ServiceArea.OperationalStatus): void {
+    const entry = this.missionProgress.find((p) => p.areaId === areaId);
+    if (!entry) return;
+    if (entry.status === status) return;
+    entry.status = status;
+    this.flushProgress();
+  }
+
+  /**
+   * Advance progress markers to reflect a `currentArea` transition:
+   *   - everything earlier in the selectedAreas list gets `Completed`
+   *     (Option A semantics — we trust the sqft heuristic that advanced us)
+   *   - the new current area gets `Operating`
+   *   - anything after stays whatever it already was (usually Pending)
+   */
+  private advanceProgressTo(areaId: number): void {
+    let changed = false;
+    const targetIdx = this.selectedAreas.indexOf(areaId);
+    if (targetIdx === -1) return;
+    for (let i = 0; i < this.missionProgress.length; i++) {
+      const entry = this.missionProgress[i];
+      const entryIdx = this.selectedAreas.indexOf(entry.areaId);
+      if (entryIdx === -1) continue;
+      let desired = entry.status;
+      if (entryIdx < targetIdx) {
+        // Only mark Completed if not already terminal — preserves Skipped
+        // states that the iRobot-app-skip handler may have set.
+        if (entry.status === ServiceArea.OperationalStatus.Pending || entry.status === ServiceArea.OperationalStatus.Operating) {
+          desired = ServiceArea.OperationalStatus.Completed;
+        }
+      } else if (entryIdx === targetIdx) {
+        desired = ServiceArea.OperationalStatus.Operating;
+      }
+      if (desired !== entry.status) {
+        entry.status = desired;
+        changed = true;
+      }
+    }
+    if (changed) this.flushProgress();
+  }
+
+  /**
+   * Terminate the progress array at mission end. On a clean finish everything
+   * that isn't already Skipped becomes Completed. On error, whatever was
+   * Operating becomes Skipped (the mission ended before that area was done)
+   * and any Pending entries stay Pending (per spec — "not yet started").
+   */
+  private finalizeMissionProgress(errored: boolean): void {
+    if (this.missionProgress.length === 0) return;
+    let changed = false;
+    for (const entry of this.missionProgress) {
+      if (errored) {
+        if (entry.status === ServiceArea.OperationalStatus.Operating) {
+          entry.status = ServiceArea.OperationalStatus.Skipped;
+          changed = true;
+        }
+      } else {
+        if (
+          entry.status === ServiceArea.OperationalStatus.Operating ||
+          entry.status === ServiceArea.OperationalStatus.Pending
+        ) {
+          entry.status = ServiceArea.OperationalStatus.Completed;
+          changed = true;
+        }
+      }
+    }
+    if (changed) this.flushProgress();
+    // Leave the array populated so the controller's UI keeps showing the
+    // last mission's outcome until a new mission starts. Next selectAreas
+    // will reinit.
   }
 
   /**
@@ -784,11 +1128,16 @@ export class RoombaDevice {
       // room a millisecond later.
       if (nextIdx > this.missionMaxIndex) this.missionMaxIndex = nextIdx;
       const nextArea = this.selectedAreas[nextIdx];
+      // PROG: mark the skipped room explicitly before advancing to the next
+      // one — otherwise `advanceProgressTo(nextArea)` would overwrite it to
+      // Completed (the generic "we moved past this one" inference).
+      this.setAreaProgress(room.areaId, ServiceArea.OperationalStatus.Skipped);
       if (nextArea !== this.lastPushed.currentArea) {
         this.log.info(
           `Region ${regionId} skipped; advancing currentArea to ${nextArea} (room ${nextIdx + 1}/${this.selectedAreas.length})`,
         );
         this.setCurrentArea(nextArea);
+        this.advanceProgressTo(nextArea);
       }
     }
   }
@@ -966,6 +1315,12 @@ export class RoombaDevice {
           this.log.info(
             `Mission completed: errorCode=${completionErrorCode} totalOperationalTime=${totalOperationalTime}s`,
           );
+          // PROG finalize: mark remaining Operating/Pending areas as Completed
+          // (clean finish) or mark Operating → Skipped (error finish). Matches
+          // Matter 1.4 §1.17.5.6 semantics — Pending stays Pending on error
+          // because "not yet started".
+          const errored = completionErrorCode !== RvcOperationalState.ErrorState.NoError;
+          this.finalizeMissionProgress(errored);
           this.missionActive = false;
           this.missionLastError = 0;
         }

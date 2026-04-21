@@ -134,6 +134,22 @@ export interface RoombaDeviceConfig {
    */
   verboseState?: boolean;
   /**
+   * When a `selectAreas` command lands during an active mission, stop the
+   * current mission and immediately re-issue a `cleanRoom` with the new area
+   * list. Default: true (Option A semantics — matches iOS/macOS Home's
+   * expectation that the selection change takes effect immediately).
+   *
+   * Set to false to reject mid-mission changes with `InvalidInMode` instead —
+   * the user must pause/stop the current clean and re-select. Honest and
+   * spec-compliant (see Matter 1.4 §1.17.7.1 status codes), but requires a
+   * manual extra step from the user.
+   *
+   * Reserved for v1.7.1 — config surface lands in 1.7.0 so upgraders don't
+   * have to re-edit when the behavior ships.
+   */
+  interruptOnMidMissionSelectAreas?: boolean;
+
+  /**
    * Work around iOS Home's room-picker UI regression where picking "All Rooms"
    * (which Matter represents as `selectAreas([])`, an unconstrained mission)
    * leaves the picker checkboxes displaying only the first configured room.
@@ -171,6 +187,25 @@ export interface RoombaInfo {
   sku: string;
   softwareVer: string;
   hardwareVer: string;
+  /**
+   * Network identity reported by the ROBOT ITSELF over MQTT. Lets the plugin
+   * populate Matter's `NetworkCommissioning.Networks[]` with the vacuum's
+   * actual Wi-Fi — which is what HA / Google Home display under "Matter Info"
+   * — instead of the Matterbridge host's network (the default matter.js
+   * picks when no NetworkCommissioning cluster is present).
+   *
+   * All fields are optional: older firmware occasionally omits `wlcfg`
+   * / `netinfo` blocks entirely, and the type shim falls through to undefined
+   * rather than erroring.
+   */
+  network: {
+    /** Vacuum's MAC (colon-separated hex). Falls back to undefined if absent. */
+    mac?: string;
+    /** Wi-Fi SSID the vacuum is associated with. */
+    ssid?: string;
+    /** AP BSSID the vacuum is connected to. */
+    bssid?: string;
+  };
   /**
    * Capability flags the robot broadcasts over MQTT. We read a handful of fields
    * to decide which Matter clean modes to advertise — older models (i3+/i4+,
@@ -565,6 +600,11 @@ export class RoombaConnection extends EventEmitter {
       sku: (s.sku as string | undefined) ?? this.config.model ?? 'Roomba',
       softwareVer: (s.softwareVer as string | undefined) ?? 'unknown',
       hardwareVer: (s.hardwareVer as string | undefined) ?? 'unknown',
+      network: {
+        mac: s.mac,
+        ssid: s.wlcfg?.ssid,
+        bssid: s.netinfo?.bssid,
+      },
       capabilities: {
         multiPass: asNum(cap.multiPass) >= 1,
         // Carpet-boost / power-pass indicator varies across firmware generations:

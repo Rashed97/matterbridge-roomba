@@ -75,7 +75,7 @@
             "type": "string"
           },
           "ipAddress": {
-            "description": "Robot IP address on your local network. Must be supplied manually — cloud lookup does not return it.",
+            "description": "Robot IP address on your local network. Optional: the plugin broadcasts a UDP/5678 discovery probe at startup and auto-fills this from the Roomba's reply (works on every Roomba generation). Set it manually if your Matterbridge host can't reach the robot's subnet via broadcast (e.g. docker bridge networking without host mode, or a VLAN that doesn't forward UDP broadcasts).",
             "type": "string"
           },
           "refreshInterval": {
@@ -132,6 +132,11 @@
           },
           "iosAllRoomsWorkaround": {
             "description": "Work around an iOS Home UI bug: picking 'All Rooms' leaves the picker checkboxes showing only the first room until the subscription update lands. When ON (default), the plugin mirrors the full room list back to the SelectedAreas attribute so iOS Home's display matches intent within a few seconds. NOTE: this technically violates Matter spec §1.17.6.4 (SelectedAreas should only be updated via the SelectAreas command). Turn OFF once Apple fixes the iOS Home bug, or if you're on macOS Home only (which handles the spec-compliant empty-list semantic correctly without help).",
+            "type": "boolean",
+            "default": true
+          },
+          "interruptOnMidMissionSelectAreas": {
+            "description": "When a room selection arrives while the robot is mid-mission, stop the current clean and immediately restart with the new area list (Option A — matches what Apple/Google Home expect). Turn OFF to instead reject mid-mission changes with an InvalidInMode error, which is Matter-spec-honest but requires the user to pause/stop before re-selecting. Default: true. Reserved for v1.7.1 — the config surface ships in 1.7.0 so you don't have to re-edit on upgrade.",
             "type": "boolean",
             "default": true
           },
@@ -213,8 +218,7 @@
               "required": ["areaId", "name"]
             }
           }
-        },
-        "required": ["ipAddress"]
+        }
       }
     }
   },

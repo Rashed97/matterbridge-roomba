@@ -13,6 +13,9 @@ Uses [`@karlvr/dorita980`](https://github.com/karlvr/dorita980) for **local MQTT
 - **Full Matter 1.4 RVC error coverage.** Stuck, brush/wheel jammed, bin missing/full, water tank missing/empty/lid-open, mop-pad missing, failed-to-dock, low battery — all mapped from Roomba error codes and surfaced via `OperationalError` events so your phone can push-notify you.
 - **Multi-floor homes.** j7+/j9+/s9+ with multiple persistent maps show rooms grouped by floor.
 - **Cloud-assisted onboarding.** Paste your iRobot account email/password; the plugin auto-fetches every robot's BLID and local MQTT password.
+- **Auto-IP on the LAN.** A UDP/5678 broadcast probe at startup finds every Roomba on the subnet and fills in `ipAddress` automatically. Survives DHCP-renumbered robots with a log warning.
+- **Per-room progress reporting.** Matter 1.4 ServiceArea `ProgressReporting` feature exposes Pending / Operating / Completed / Skipped per room during a multi-room mission — so Apple Home can show "cleaning: Living Room → Kitchen → Done" as it happens.
+- **Vacuum-accurate metadata in HA / Google Home.** Hardware version, serial number, part number, and the robot's own SSID show up correctly in the controller's "Matter Info" panel — not the Matterbridge host's.
 - **Room discovery built-in.** A single button in the Matterbridge UI captures your rooms from the robot's own clean commands — no hand-editing IDs.
 - **Skip detection.** Press Skip in the iRobot app; Apple Home's "currently cleaning" indicator advances to the next room within a second.
 - **Self-healing reconnects.** Exponential backoff, TLS cipher rotation, and automatic state refresh after recovery.
@@ -37,7 +40,7 @@ matterbridge -add matterbridge-roomba
 
 ## Quick start (cloud-assisted)
 
-The simplest setup: your iRobot account email/password + the robot's LAN IP.
+The simplest setup: just your iRobot account email/password + the robot's name.
 
 ```jsonc
 {
@@ -49,14 +52,15 @@ The simplest setup: your iRobot account email/password + the robot's LAN IP.
   },
   "devices": [
     {
-      "name": "Rumi",
-      "ipAddress": "192.168.1.214"
+      "name": "Rumi"
     }
   ]
 }
 ```
 
-Restart the plugin — BLID, local MQTT password, model, and firmware are fetched from the iRobot cloud automatically. Use **Test cloud login** in the frontend to verify credentials before restarting.
+Restart the plugin — BLID, local MQTT password, model, and firmware are fetched from the iRobot cloud automatically, and the **IP address is auto-discovered on the LAN** (UDP broadcast on port 5678, the same protocol the iRobot app uses). Use **Test cloud login** in the frontend to verify credentials before restarting.
+
+You can still set `ipAddress` manually — needed only when Matterbridge and the Roomba are on different subnets, or when you're running Matterbridge in a docker bridge network (which silently drops the discovery probe). A warning is logged if auto-discovery and the configured value disagree, so you'll know if DHCP has moved the robot.
 
 Then run through the onboarding flow in [ONBOARDING.md](./ONBOARDING.md) to discover and name your rooms.
 
@@ -95,7 +99,8 @@ To retrieve `blid` / `password` without sharing iRobot credentials, run `npx @ka
 | `RvcOperationalState.GoHome` | "Send to Dock" | `stop()` then `dock()` (prevents dock-loop) |
 | `Identify.Identify` | "Identify" | `find()` — beep locator |
 | `ServiceArea.SelectAreas` | room selector | resolves pmap + region IDs, calls `cleanRoom()` |
-| Room skip in iRobot app | Controller's "currently cleaning" advances | state detection (no Matter command yet) |
+| `ServiceArea.Progress` (PROG feature) | per-room Pending / Operating / Completed status during a multi-room mission | sqft-based advance + iRobot-app Skip marks |
+| Room skip in iRobot app | Controller's "currently cleaning" advances + area marked `Skipped` | state detection (no local MQTT skip command exists) |
 | Battery & charge state | Battery icon | `batPct` + `phase === 'charge'` |
 | Bin full / tank empty / stuck / dock failed | Error notification | mapped to Matter RVC error states + `OperationalError` event |
 
@@ -126,7 +131,7 @@ For **multi-floor homes** (j7+/j9+/s9+ with multiple pmaps), run discovery on ea
 | `devices[].name` | — | Friendly name shown in the Matter controller |
 | `devices[].blid` | — | Robot's MQTT username (auto-filled by cloud onboarding) |
 | `devices[].password` | — | Robot's LOCAL MQTT password (not your iRobot password) |
-| `devices[].ipAddress` | — | Robot's LAN IP (required; not auto-detected) |
+| `devices[].ipAddress` | auto-discovered | Robot's LAN IP. Optional since v1.7 — UDP/5678 broadcast discovery fills it in. Set manually only when auto-discovery can't reach the robot (docker bridge net, VLAN without broadcast forwarding). |
 | `devices[].serverMode` | `true` | Standalone Matter server vs bridged endpoint |
 | `devices[].vendor` | `"iRobot"` | BasicInformation vendor name |
 | `devices[].model` | robot-reported SKU | BasicInformation model name |
@@ -139,6 +144,7 @@ For **multi-floor homes** (j7+/j9+/s9+ with multiple pmaps), run discovery on ea
 | `devices[].pmapId` / `.userPmapvId` | — | Single-map pmap reference (auto-filled by discovery) |
 | `devices[].maps[]` | `[]` | Multi-floor pmap list (auto-filled by discovery) |
 | `devices[].rooms[]` | `[]` | Room list (auto-filled by discovery) |
+| `devices[].interruptOnMidMissionSelectAreas` | `true` | (reserved for v1.7.1) On mid-mission room-selection changes, stop and restart with the new list (`true`, matches Apple/Google Home's UX expectation) vs reject with InvalidInMode (`false`). |
 
 Full JSON schema in [`matterbridge-roomba.schema.json`](./matterbridge-roomba.schema.json).
 
@@ -155,9 +161,11 @@ Full JSON schema in [`matterbridge-roomba.schema.json`](./matterbridge-roomba.sc
 ## Known limitations
 
 - **No per-region progress report from the j-series firmware.** `cleanMissionStatus.sqft` and `mssnM` stay at 0 on j5+ during a mission. Without those, multi-room `currentArea` cycling relies on wall-clock time — imprecise when room sizes vary.
-- **SkipArea command not forwarded to the robot.** Matterbridge's cluster server doesn't route `SkipArea` to plugins yet, and `@karlvr/dorita980` doesn't expose a `skip()` method. We detect skip-from-iRobot-app and advance Matter state, but the other direction (skip from Matter controller → robot) is blocked upstream.
+- **SkipArea command not wired end-to-end.** The iRobot local MQTT protocol doesn't publicly document a "skip current room" command — neither dorita980, NickWaterton's Roomba980-Python, roombapy, nor openHAB's iRobot binding ship one, and we're not going to guess at a wire format that might confuse the firmware. Separately, matterbridge's ServiceArea cluster server doesn't route the Matter `SkipArea` command to plugins yet either. Until someone captures the wire format from the iRobot app (mitmproxy/Wireshark) or matterbridge adds a routing hook, SkipArea-from-controller will return `InvalidInMode`. Skip-from-iRobot-app *is* detected and flows through to Matter's `currentArea` + `Progress[]` (Skipped status) correctly.
 - **"Matter Accessory" during pairing.** All open-source Matter devices use the CSA test VendorID `0xfff1`, which Apple Home doesn't map to a brand. After pairing, the accessory details correctly show `iRobot` as manufacturer.
 - **iOS Home's room picker briefly shows "1 Room" after picking "All Rooms"** — then resolves to "All Rooms" after the subscription update lands (a few seconds). This is an iOS Home UI quirk; Apple sends `selectAreas([])` to mean "unconstrained", and the plugin mirrors the full area list back so the summary renders correctly, but iOS's local picker state lags the subscription briefly. macOS Home handles the empty-list semantic correctly without any lag.
+- **MAC address in HA's "Matter Info" is the Matterbridge host's, not the Roomba's.** matter.js builds `GeneralDiagnostics.NetworkInterfaces` from the host OS's real NIC list; there's no plugin hook to swap it out per-device. The **SSID**, **Hardware version**, **Part number**, and **Serial number** are all correctly sourced from the robot (plugin reads the Roomba's MQTT state and pushes them into `BasicInformation` + `NetworkCommissioning`). If fixing the MAC matters for your use-case, overriding `GeneralDiagnostics.NetworkInterfaces` post-start with a synthetic entry carrying `RoombaInfo.network.mac` is a ~40-line change in `src/roombaDevice.ts`; open an issue if you want it prioritized.
+- **`BridgedDeviceBasicInformation` StartUp/ShutDown events** aren't fired for users who opt into `serverMode: false`. The default (server mode, one root node per robot) gets `BasicInformation.startUp` auto-fired by the Matter SDK. Bridged-mode users would only miss diagnostic event-log entries — not a functional break. Open an issue if this matters to you.
 - **Schedule / do-not-disturb / map geometry** — Matter doesn't define clusters for these. They stay in the iRobot app.
 
 ## Credits
