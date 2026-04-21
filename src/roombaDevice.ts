@@ -1455,7 +1455,22 @@ function parseSoftwareVersion(ver: string): number {
   return Number(major) * 10000 + Number(minor) * 100 + Number(patch);
 }
 
+/**
+ * Extract a numeric `hardwareVersion` from Roomba's hardware string. Matter
+ * mandates this as a uint16 (spec §11.1.5.5 — max 65535), so we clamp
+ * aggressively: Roomba SKUs like "j517020" would overflow if taken verbatim
+ * (and a single set() with an oversized hardwareVersion rejects the entire
+ * payload, silently undoing the BasicInformation override).
+ *
+ * Strategy: take the FIRST digit of the first letter-prefixed identifier
+ * when we can (e.g. `j517020` → `5` for "j5 series"), otherwise clamp the
+ * first digit run to 65535. Falls back to 1 when nothing parses.
+ */
 function parseHardwareVersion(ver: string): number {
-  const match = /(\d+)/.exec(ver);
-  return match ? Number(match[1]) : 1;
+  // Preferred: match a letter-prefixed SKU like `j5`, `s9`, `i7` → the digit.
+  const skuMatch = /[a-zA-Z](\d)/.exec(ver);
+  if (skuMatch) return Number(skuMatch[1]);
+  const digitsMatch = /(\d+)/.exec(ver);
+  if (!digitsMatch) return 1;
+  return Math.min(Number(digitsMatch[1]), 65535);
 }
