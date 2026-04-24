@@ -241,6 +241,7 @@ export class RoombaDevice {
   private readonly family: RoombaFamily;
   private readonly iosAllRoomsWorkaround: boolean;
   private readonly exposeRobotNetworkInfo: boolean;
+  private readonly overrideRobotNetworkInterfaces: boolean;
   /** Most recent RvcCleanMode the controller asked for. Checked at startCleaning time. */
   private pendingCleanMode: number | undefined;
 
@@ -259,9 +260,11 @@ export class RoombaDevice {
     cleanCapabilities: CleanModeCapabilities = { multiPass: false, carpetBoost: false },
     iosAllRoomsWorkaround = true,
     exposeRobotNetworkInfo = true,
+    overrideRobotNetworkInterfaces = false,
   ) {
     this.iosAllRoomsWorkaround = iosAllRoomsWorkaround;
     this.exposeRobotNetworkInfo = exposeRobotNetworkInfo;
+    this.overrideRobotNetworkInterfaces = overrideRobotNetworkInterfaces;
     this.serverMode = serverMode;
     this.rooms = rooms ?? [];
     this.maps = maps ?? [];
@@ -505,15 +508,18 @@ export class RoombaDevice {
       );
     }
 
-    // GeneralDiagnostics.NetworkInterfaces override. matter.js's
-    // `#updateNetworkList` populates this from the HOST's NICs on the
-    // `lifecycle.online` edge — which is why HA showed "Network type:
-    // Ethernet" + the bridge's MAC. We can't race that initial write, but
-    // we CAN overwrite it ~2s later with a synthetic entry carrying the
-    // Roomba's own MAC + SSID-implied type=WiFi. The NC-based default-type
-    // inference is inconsistent across matter.js minor versions; this
-    // direct override sidesteps the detection entirely.
-    if (this.pendingRootOverride.robotMac || this.pendingRootOverride.robotSsid) {
+    // GeneralDiagnostics.NetworkInterfaces override — OPT-IN ONLY.
+    // Faking the NetworkInterfaces entry with the Roomba's MAC + empty
+    // IP lists causes Apple Home (iOS) to get stuck in "Updating…" after
+    // network transitions — likely a reachability-integrity check using
+    // the MAC. Spec (§11.11.6.7) says NetworkInterfaces is diagnostic-only,
+    // but Apple treats it as authoritative for routing heuristics.
+    // Default: off. Enable via `overrideRobotNetworkInterfaces: true` to
+    // experiment — be prepared to re-pair Apple devices after toggling.
+    if (
+      this.overrideRobotNetworkInterfaces &&
+      (this.pendingRootOverride.robotMac || this.pendingRootOverride.robotSsid)
+    ) {
       this.scheduleGeneralDiagnosticsOverride(serverNode);
     }
   }

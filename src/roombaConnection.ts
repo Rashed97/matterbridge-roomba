@@ -172,6 +172,33 @@ export interface RoombaDeviceConfig {
   exposeRobotNetworkInfo?: boolean;
 
   /**
+   * Override `GeneralDiagnostics.NetworkInterfaces` on the root endpoint
+   * with a synthetic entry carrying the Roomba's own MAC + type=WiFi
+   * (instead of the Matterbridge host's real NIC info that matter.js
+   * auto-populates). Default: **false**.
+   *
+   * The Matter spec (§11.11.6.7) defines `NetworkInterfaces` as
+   * diagnostic-only — it's supposed to reflect the adapters the device
+   * itself actually sees — and faking it with another device's MAC has
+   * caused Apple Home (iOS) to enter a "Updating…" loop after network
+   * transitions (WiFi off/on, leaving home and returning). The theory
+   * is that iOS Home uses the MAC + empty-IP-lists combination as a
+   * reachability-integrity check and gets confused when the MAC doesn't
+   * match anything routable from its local subnet.
+   *
+   * With this set to `false` (default) HA's "Matter Info" shows the
+   * Matterbridge host's MAC instead of the Roomba's — which is less
+   * intuitive but spec-compliant and doesn't upset iOS Home. The SSID
+   * still displays correctly (that's via the separate
+   * `NetworkCommissioning` cluster, which is read-only and safe).
+   *
+   * Turn this on only to experiment with showing the Roomba's MAC. You'll
+   * need to re-pair the accessory from any Apple devices after toggling,
+   * and watch for regression across network transitions.
+   */
+  overrideRobotNetworkInterfaces?: boolean;
+
+  /**
    * When a `selectAreas` command lands during an active mission, stop the
    * current mission and immediately re-issue a `cleanRoom` with the new area
    * list. Default: true (Option A semantics — matches iOS/macOS Home's
