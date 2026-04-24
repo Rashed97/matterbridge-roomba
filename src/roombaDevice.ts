@@ -240,6 +240,7 @@ export class RoombaDevice {
 
   private readonly family: RoombaFamily;
   private readonly iosAllRoomsWorkaround: boolean;
+  private readonly exposeRobotNetworkInfo: boolean;
   /** Most recent RvcCleanMode the controller asked for. Checked at startCleaning time. */
   private pendingCleanMode: number | undefined;
 
@@ -257,8 +258,10 @@ export class RoombaDevice {
     maps: RoombaMapConfig[] | undefined = undefined,
     cleanCapabilities: CleanModeCapabilities = { multiPass: false, carpetBoost: false },
     iosAllRoomsWorkaround = true,
+    exposeRobotNetworkInfo = true,
   ) {
     this.iosAllRoomsWorkaround = iosAllRoomsWorkaround;
+    this.exposeRobotNetworkInfo = exposeRobotNetworkInfo;
     this.serverMode = serverMode;
     this.rooms = rooms ?? [];
     this.maps = maps ?? [];
@@ -469,6 +472,23 @@ export class RoombaDevice {
       );
     } catch (err) {
       this.log.warn(`Failed to override root node identity for ${this.deviceName}: ${err}`);
+    }
+
+    // Opt-out path: skip the NetworkCommissioning + GeneralDiagnostics
+    // overrides entirely. Apple Home's Home hub on some iOS builds gets
+    // stuck in "Updating…" after these clusters are added to an
+    // already-commissioned device — the added schema triggers a re-read
+    // that Apple doesn't gracefully recover from. Other controllers
+    // (Google Home, HA) tolerate it. Default ON; flip off to fall back
+    // to pre-v1.7 display (host's network shown in Matter Info).
+    if (!this.exposeRobotNetworkInfo) {
+      this.log.info(
+        `Robot network-info override disabled for ${this.deviceName} (` +
+          `exposeRobotNetworkInfo=false). HA/Google Home will show the bridge's ` +
+          `network info instead of the vacuum's. Toggle this back on after Apple ` +
+          `Home is happy again.`,
+      );
+      return;
     }
 
     // Best-effort NetworkCommissioning attach on root — carries the ROBOT's
@@ -1216,14 +1236,21 @@ export class RoombaDevice {
   }
 
   /**
-   * Flip the `reachable` attribute on BridgedDeviceBasicInformation. Apple Home
-   * reads this to display "No Response" on an accessory tile when the robot is
-   * unreachable; matter.js auto-fires the `ReachableChanged` event when the
-   * attribute transitions. Safe to call before `markActive()` — we skip the
-   * write silently in that case, avoiding the "endpoint inactive" error spam.
+   * Flip the `reachable` attribute on BridgedDeviceBasicInformation (bridged
+   * mode only). In server mode the endpoint IS the root and has BasicInformation
+   * instead — matter.js doesn't enable `reachable` on default BasicInformation,
+   * so there's nothing we can write to. Apple Home infers offline state from
+   * subscription timeouts instead, which works fine.
+   *
+   * Safe to call before `markActive()` — we skip the write silently in that
+   * case, avoiding the "endpoint inactive" error spam.
    */
   setReachable(reachable: boolean): void {
     if (!this.endpointActive) return;
+    // Server mode: bridgedDeviceBasicInformation doesn't exist on the endpoint;
+    // writing would throw 'cluster not found'. No-op is the right answer — the
+    // fabric layer handles offline detection.
+    if (this.serverMode) return;
     try {
       this.device.setAttribute('bridgedDeviceBasicInformation', 'reachable', reachable, this.log);
     } catch (err) {

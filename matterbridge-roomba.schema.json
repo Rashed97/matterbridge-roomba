@@ -135,6 +135,11 @@
             "type": "boolean",
             "default": true
           },
+          "exposeRobotNetworkInfo": {
+            "description": "Populate the Matter NetworkCommissioning cluster (SSID) + GeneralDiagnostics.NetworkInterfaces (Network type = WiFi, Roomba's own MAC) on the device's root node so controllers show the VACUUM's network info instead of the Matterbridge host's. Default ON. Turn OFF and re-pair if Apple Home shows the accessory stuck in 'Updating...' after upgrading the plugin — Apple's Home hub can get confused by clusters being added to an already-commissioned device. Does not affect the plugin's actual functionality, only the Matter Info display.",
+            "type": "boolean",
+            "default": true
+          },
           "interruptOnMidMissionSelectAreas": {
             "description": "When a room selection arrives while the robot is mid-mission, stop the current clean and immediately restart with the new area list (Option A — matches what Apple/Google Home expect). Turn OFF to instead reject mid-mission changes with an InvalidInMode error, which is Matter-spec-honest but requires the user to pause/stop before re-selecting. Default: true. Reserved for v1.7.1 — the config surface ships in 1.7.0 so you don't have to re-edit on upgrade.",
             "type": "boolean",

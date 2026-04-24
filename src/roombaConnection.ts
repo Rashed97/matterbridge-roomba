@@ -154,6 +154,24 @@ export interface RoombaDeviceConfig {
    */
   verboseState?: boolean;
   /**
+   * Populate `NetworkCommissioning` cluster + `GeneralDiagnostics.NetworkInterfaces`
+   * on the Matter root node with the VACUUM'S own Wi-Fi info (SSID, MAC, Type=WiFi)
+   * instead of leaving matter.js's auto-populated host-NIC defaults in place.
+   *
+   * Default: `true`. Set to `false` if your Matter controller (notably
+   * Apple Home on some iOS versions) gets stuck in "Updating…" after the
+   * plugin is updated — Apple's Home hub is spec-strict and may not tolerate
+   * the NetworkCommissioning cluster being added post-commissioning without
+   * re-pairing. Turning this off reverts to the pre-v1.7 display (Network
+   * type: Ethernet, MAC: bridge host's, SSID: blank) but keeps the rest of
+   * the plugin working.
+   *
+   * After flipping this, remove + re-pair the accessory from the affected
+   * controller for the change to take effect cleanly.
+   */
+  exposeRobotNetworkInfo?: boolean;
+
+  /**
    * When a `selectAreas` command lands during an active mission, stop the
    * current mission and immediately re-issue a `cleanRoom` with the new area
    * list. Default: true (Option A semantics — matches iOS/macOS Home's
