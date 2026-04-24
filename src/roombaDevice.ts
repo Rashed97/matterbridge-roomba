@@ -570,9 +570,26 @@ export class RoombaDevice {
   /**
    * Attach a WiFi-featured NetworkCommissioning behavior to the root endpoint
    * so HA / Google Home show the Roomba's Wi-Fi SSID and network type.
-   * Dynamic import to keep the behavior class out of the plugin's main chunk
-   * when unused (e.g. bridged-mode users), and to gracefully handle matter.js
-   * versions where the import shape differs.
+   *
+   * Matter §11.9 mandates 5 commands when the WiFi feature is declared:
+   * `scanNetworks`, `addOrUpdateWiFiNetwork`, `removeNetwork`,
+   * `connectNetwork`, `reorderNetwork`. matter.js's default implementations
+   * throw "unimplemented exception" (the `ValidatedElements` warnings we
+   * saw) which makes Apple Home's Home hub stick in "Updating…".
+   *
+   * The Roomba's network is managed out-of-band via the iRobot app — there
+   * is no sensible way for Matter to (re)configure the vacuum's Wi-Fi, and
+   * letting it would be a terrible idea regardless (dorita980 exposes no
+   * setter for wireless config, so we couldn't act on the command anyway).
+   * But the spec DOES anticipate this case: each command has a
+   * `NetworkCommissioningStatus` enum with values for "device doesn't
+   * support the operation" (NetworkIdNotFound, OtherConnectionFailure,
+   * etc.). We override the 5 commands to return those statuses politely,
+   * which turns the cluster into a read-only informational surface — fully
+   * spec-compliant — and keeps the SSID visible in `Networks[0]`.
+   *
+   * Dynamic imports so the plugin still loads on matterbridge minors that
+   * happen to drop the modules.
    */
   private async attachWifiNetworkCommissioning(
     serverNode: {
@@ -582,19 +599,71 @@ export class RoombaDevice {
     ssid: string,
   ): Promise<void> {
     try {
-      // matterbridge re-exports every @matter/node behavior from its
-      // `matter/behaviors` barrel; we dynamic-import so the plugin still
-      // loads on any matterbridge minor that happens to drop the symbol.
       const { NetworkCommissioningServer } = await import('matterbridge/matter/behaviors');
       const { NetworkCommissioning } = await import('matterbridge/matter/clusters');
-      const WifiNC = (NetworkCommissioningServer as unknown as {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const BaseWifiNC: any = (NetworkCommissioningServer as unknown as {
         with: (...features: unknown[]) => unknown;
       }).with(NetworkCommissioning.Feature.WiFiNetworkInterface);
       const ssidBytes = Buffer.from(ssid.slice(0, 32), 'utf8');
-      serverNode.behaviors?.require(WifiNC, {
+      const Status = NetworkCommissioning.NetworkCommissioningStatus;
+      const log = this.log;
+      const debugMsg = 'Roomba Wi-Fi is provisioned via the iRobot app; Matter has no setter';
+
+      // Subclass the feature-enabled base behavior and implement each
+      // required command. Returns are the matter.js response shapes for
+      // each command (see @matter/types/clusters/network-commissioning).
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const ReadOnlyWifiNC = class extends BaseWifiNC {
+        // spec: return a list of visible WiFi networks. We have no way to
+        // scan and no reason to; return Success + an empty result set. The
+        // client gets a well-formed response and decides accordingly.
+        async scanNetworks(): Promise<unknown> {
+          log.debug('NetworkCommissioning.scanNetworks invoked — returning empty scan result (read-only cluster)');
+          return {
+            networkingStatus: Status.Success,
+            debugText: debugMsg,
+            wiFiScanResults: [],
+            threadScanResults: [],
+          };
+        }
+        // spec: replace or add a network. We don't accept configuration —
+        // BoundsExceeded with maxNetworks=1 + the ssid already present is
+        // the closest semantic match ("collection full").
+        async addOrUpdateWiFiNetwork(): Promise<unknown> {
+          log.debug('NetworkCommissioning.addOrUpdateWiFiNetwork rejected — read-only cluster');
+          return { networkingStatus: Status.BoundsExceeded, debugText: debugMsg, networkIndex: 0 };
+        }
+        // spec: remove a configured network. We never have any removable
+        // networks — the one entry is device-managed.
+        async removeNetwork(): Promise<unknown> {
+          log.debug('NetworkCommissioning.removeNetwork rejected — read-only cluster');
+          return { networkingStatus: Status.NetworkIdNotFound, debugText: debugMsg, networkIndex: 0 };
+        }
+        // spec: initiate connection to a configured network. We're already
+        // connected (see Networks[0].connected=true) and have no control
+        // knob. OtherConnectionFailure tells the controller "I'm not doing
+        // that" without implying a transient issue.
+        async connectNetwork(): Promise<unknown> {
+          log.debug('NetworkCommissioning.connectNetwork rejected — read-only cluster');
+          return {
+            networkingStatus: Status.OtherConnectionFailure,
+            debugText: debugMsg,
+            errorValue: null,
+          };
+        }
+        // spec: reorder the network priority list. Single-entry list has
+        // no order to change.
+        async reorderNetwork(): Promise<unknown> {
+          log.debug('NetworkCommissioning.reorderNetwork rejected — read-only cluster');
+          return { networkingStatus: Status.NetworkIdNotFound, debugText: debugMsg, networkIndex: 0 };
+        }
+      };
+
+      serverNode.behaviors?.require(ReadOnlyWifiNC, {
         maxNetworks: 1,
         interfaceEnabled: true,
-        lastNetworkingStatus: NetworkCommissioning.NetworkCommissioningStatus.Success,
+        lastNetworkingStatus: Status.Success,
         lastNetworkId: ssidBytes,
         lastConnectErrorValue: null,
         networks: [{ networkId: ssidBytes, connected: true }],
@@ -603,8 +672,8 @@ export class RoombaDevice {
         supportedWiFiBands: [NetworkCommissioning.WiFiBand['2G4']],
       });
       this.log.info(
-        `Attached NetworkCommissioning(WiFi) to root with SSID "${ssid}" — ` +
-          `Matter controllers now see the vacuum's own Wi-Fi, not the bridge's.`,
+        `Attached NetworkCommissioning(WiFi, read-only) to root with SSID "${ssid}" — ` +
+          `commissioning commands return proper Matter statuses (no-op) per spec §11.9.`,
       );
     } catch (err) {
       this.log.debug(
