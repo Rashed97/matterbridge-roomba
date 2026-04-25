@@ -243,6 +243,7 @@ export class RoombaDevice {
   private readonly exposeRobotNetworkInfo: boolean;
   private readonly overrideRobotNetworkInterfaces: boolean;
   private readonly disableRootCustomizations: boolean;
+  private readonly useExtendedBasicInformation: boolean;
   /** Most recent RvcCleanMode the controller asked for. Checked at startCleaning time. */
   private pendingCleanMode: number | undefined;
 
@@ -263,11 +264,13 @@ export class RoombaDevice {
     exposeRobotNetworkInfo = true,
     overrideRobotNetworkInterfaces = false,
     disableRootCustomizations = false,
+    useExtendedBasicInformation = false,
   ) {
     this.iosAllRoomsWorkaround = iosAllRoomsWorkaround;
     this.exposeRobotNetworkInfo = exposeRobotNetworkInfo;
     this.overrideRobotNetworkInterfaces = overrideRobotNetworkInterfaces;
     this.disableRootCustomizations = disableRootCustomizations;
+    this.useExtendedBasicInformation = useExtendedBasicInformation;
     this.serverMode = serverMode;
     this.rooms = rooms ?? [];
     this.maps = maps ?? [];
@@ -471,9 +474,15 @@ export class RoombaDevice {
       hardwareVersion: this.pendingRootOverride.hardwareVersion,
       hardwareVersionString: this.pendingRootOverride.hardwareVersionString.slice(0, 64),
     };
-    if (this.pendingRootOverride.partNumber) basicInformation.partNumber = this.pendingRootOverride.partNumber.slice(0, 32);
-    if (this.pendingRootOverride.productLabel) basicInformation.productLabel = this.pendingRootOverride.productLabel.slice(0, 64);
-    if (this.pendingRootOverride.serialNumber) basicInformation.serialNumber = this.pendingRootOverride.serialNumber.slice(0, 32);
+    // Extended fields (partNumber, productLabel, serialNumber) gated behind a
+    // separate flag — Apple may be strict about writing Fixed-conformance
+    // attributes on an already-commissioned device, and these are the
+    // v1.7.0 additions on top of the v1.6.0 baseline that's known to work.
+    if (this.useExtendedBasicInformation) {
+      if (this.pendingRootOverride.partNumber) basicInformation.partNumber = this.pendingRootOverride.partNumber.slice(0, 32);
+      if (this.pendingRootOverride.productLabel) basicInformation.productLabel = this.pendingRootOverride.productLabel.slice(0, 64);
+      if (this.pendingRootOverride.serialNumber) basicInformation.serialNumber = this.pendingRootOverride.serialNumber.slice(0, 32);
+    }
 
     try {
       await serverNode.set({ basicInformation });
@@ -482,8 +491,9 @@ export class RoombaDevice {
           `vendorName=${this.pendingRootOverride.vendorName} ` +
           `productName=${this.pendingRootOverride.productName} ` +
           `softwareVersionString=${this.pendingRootOverride.softwareVersionString}` +
-          (this.pendingRootOverride.partNumber ? ` partNumber=${this.pendingRootOverride.partNumber}` : '') +
-          (this.pendingRootOverride.serialNumber ? ` serialNumber=${this.pendingRootOverride.serialNumber}` : ''),
+          (this.useExtendedBasicInformation && this.pendingRootOverride.partNumber ? ` partNumber=${this.pendingRootOverride.partNumber}` : '') +
+          (this.useExtendedBasicInformation && this.pendingRootOverride.serialNumber ? ` serialNumber=${this.pendingRootOverride.serialNumber}` : '') +
+          (!this.useExtendedBasicInformation ? ' (extended fields disabled)' : ''),
       );
     } catch (err) {
       this.log.warn(`Failed to override root node identity for ${this.deviceName}: ${err}`);

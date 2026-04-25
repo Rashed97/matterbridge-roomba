@@ -218,6 +218,19 @@ export interface RoombaDeviceConfig {
   disableRootCustomizations?: boolean;
 
   /**
+   * Include the extended BasicInformation fields added in v1.7.0
+   * (`partNumber`, `productLabel`, `serialNumber`) when overriding the
+   * root node identity. The v1.6.0 baseline (`vendorName`, `productName`,
+   * `softwareVersion*`, `hardwareVersion*`) is always set when the master
+   * `disableRootCustomizations` is off.
+   *
+   * Default: false. Useful for bisecting iOS Home connectivity regressions
+   * — Apple may be sensitive to writing fields that the spec marks as
+   * Fixed (set-once) on an already-commissioned device.
+   */
+  useExtendedBasicInformation?: boolean;
+
+  /**
    * When a `selectAreas` command lands during an active mission, stop the
    * current mission and immediately re-issue a `cleanRoom` with the new area
    * list. Default: true (Option A semantics — matches iOS/macOS Home's

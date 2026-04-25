@@ -146,7 +146,12 @@
             "default": false
           },
           "disableRootCustomizations": {
-            "description": "Debug kill-switch: skip ALL root-node customizations (BasicInformation overrides, NetworkCommissioning attach, GeneralDiagnostics override). With this on, Apple Home sees matterbridge's defaults (firmware 3.x, generic hardware string, no SSID). Use to bisect iOS Home connectivity regressions — if iOS is stable with this true and broken with this false, the issue is one of the root-level enhancements. Re-pair any controllers after toggling.",
+            "description": "Debug kill-switch: skip ALL root-node customizations (BasicInformation overrides, NetworkCommissioning attach, GeneralDiagnostics override). With this on, Apple Home sees matterbridge's defaults (firmware 3.x, generic hardware string, no SSID). Use to bisect iOS Home connectivity regressions — if iOS is stable with this true and broken with this false, the issue is one of the root-level enhancements. Re-pair (or reboot iPhone) after toggling.",
+            "type": "boolean",
+            "default": false
+          },
+          "useExtendedBasicInformation": {
+            "description": "Include the v1.7.0 BasicInformation extras (partNumber, productLabel, serialNumber) in the root-node identity override. The v1.6.0 baseline (vendorName, productName, softwareVersion, hardwareVersion) is always applied when disableRootCustomizations is off. Default false until we confirm Apple Home tolerates writing these Fixed-conformance fields on a commissioned device. Reboot iPhone after toggling.",
             "type": "boolean",
             "default": false
           },
