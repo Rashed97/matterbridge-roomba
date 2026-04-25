@@ -145,6 +145,11 @@
             "type": "boolean",
             "default": false
           },
+          "disableRootCustomizations": {
+            "description": "Debug kill-switch: skip ALL root-node customizations (BasicInformation overrides, NetworkCommissioning attach, GeneralDiagnostics override). With this on, Apple Home sees matterbridge's defaults (firmware 3.x, generic hardware string, no SSID). Use to bisect iOS Home connectivity regressions — if iOS is stable with this true and broken with this false, the issue is one of the root-level enhancements. Re-pair any controllers after toggling.",
+            "type": "boolean",
+            "default": false
+          },
           "interruptOnMidMissionSelectAreas": {
             "description": "When a room selection arrives while the robot is mid-mission, stop the current clean and immediately restart with the new area list (Option A — matches what Apple/Google Home expect). Turn OFF to instead reject mid-mission changes with an InvalidInMode error, which is Matter-spec-honest but requires the user to pause/stop before re-selecting. Default: true. Reserved for v1.7.1 — the config surface ships in 1.7.0 so you don't have to re-edit on upgrade.",
             "type": "boolean",

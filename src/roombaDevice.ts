@@ -242,6 +242,7 @@ export class RoombaDevice {
   private readonly iosAllRoomsWorkaround: boolean;
   private readonly exposeRobotNetworkInfo: boolean;
   private readonly overrideRobotNetworkInterfaces: boolean;
+  private readonly disableRootCustomizations: boolean;
   /** Most recent RvcCleanMode the controller asked for. Checked at startCleaning time. */
   private pendingCleanMode: number | undefined;
 
@@ -261,10 +262,12 @@ export class RoombaDevice {
     iosAllRoomsWorkaround = true,
     exposeRobotNetworkInfo = true,
     overrideRobotNetworkInterfaces = false,
+    disableRootCustomizations = false,
   ) {
     this.iosAllRoomsWorkaround = iosAllRoomsWorkaround;
     this.exposeRobotNetworkInfo = exposeRobotNetworkInfo;
     this.overrideRobotNetworkInterfaces = overrideRobotNetworkInterfaces;
+    this.disableRootCustomizations = disableRootCustomizations;
     this.serverMode = serverMode;
     this.rooms = rooms ?? [];
     this.maps = maps ?? [];
@@ -434,6 +437,15 @@ export class RoombaDevice {
    */
   async overrideRootNodeIdentity(): Promise<void> {
     if (!this.serverMode || !this.pendingRootOverride) return;
+    if (this.disableRootCustomizations) {
+      this.log.info(
+        `[${this.deviceName}] disableRootCustomizations=true — skipping all root-node ` +
+          `BasicInformation/NetworkCommissioning/GeneralDiagnostics customizations. ` +
+          `Apple Home should see the matterbridge defaults (firmware 3.x, hardware kernel string, ` +
+          `bridge MAC, no SSID). Use this to bisect iOS connectivity regressions.`,
+      );
+      return;
+    }
     // `serverNode` is attached by matterbridge in createDeviceServerNode — it's a
     // matter.js ServerNode whose endpoint-0 `basicInformation` we need to patch.
     const serverNode = (this.device as unknown as { serverNode?: {

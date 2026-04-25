@@ -199,6 +199,25 @@ export interface RoombaDeviceConfig {
   overrideRobotNetworkInterfaces?: boolean;
 
   /**
+   * Master kill-switch: when true, the plugin skips ALL v1.7.0+ root-node
+   * customizations — no `BasicInformation` overrides (vendor/product/
+   * version/partNumber/productLabel/serialNumber stay at matterbridge's
+   * defaults), no `NetworkCommissioning` attach (no SSID display), no
+   * `GeneralDiagnostics` override. Endpoint-level features (RVC clusters,
+   * ServiceArea PROG, etc.) are unaffected.
+   *
+   * Use this to bisect Apple Home connectivity issues: if iOS Home is
+   * stable with this true and broken with this false, the regression is
+   * caused by one of the root-level schema enhancements. Re-enable
+   * components one at a time (clear this flag, then toggle
+   * `exposeRobotNetworkInfo`/`overrideRobotNetworkInterfaces`) to find
+   * the exact culprit.
+   *
+   * Default: false. This is a debug aid — leave it off in normal use.
+   */
+  disableRootCustomizations?: boolean;
+
+  /**
    * When a `selectAreas` command lands during an active mission, stop the
    * current mission and immediately re-issue a `cleanRoom` with the new area
    * list. Default: true (Option A semantics — matches iOS/macOS Home's
