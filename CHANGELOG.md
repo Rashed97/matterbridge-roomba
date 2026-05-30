@@ -4,9 +4,13 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.7.0] — 2026-04-20
+## [1.7.0] — 2026-05-29
 
 Focused release on controller metadata correctness + per-room progress.
+Includes several follow-up fixes discovered during live testing on a j5+:
+hex SSID decoding, hardware-version uint16 clamping, spec-compliant
+NetworkCommissioning command handlers, and four bisection-friendly config
+toggles for working around controller-specific quirks.
 
 ### Added
 
@@ -57,6 +61,67 @@ Focused release on controller metadata correctness + per-room progress.
   `Maps` feature; we override the method in the subclass to add
   `ProgressReporting` too. No upstream matterbridge patch needed.
 
+### Fixed
+
+- **Roomba SSID is hex-encoded over MQTT.** `wlcfg.ssid` arrives as a
+  hex string of the UTF-8 bytes (e.g. `426C756520526162626974` for
+  `Blue Rabbit`). Decode in `RoombaConnection.getInfo()` before handing to
+  Matter — without the decode, controllers display the raw hex.
+- **`wlcfg` / `netinfo` / `wifistat` / `mac` aren't in the default state
+  stream.** j-series firmware omits these from MQTT heartbeats. Added an
+  explicit `getWirelessConfig()` fetch during `fetchIdentity()` so SSID and
+  signal info are available at startup.
+- **`hardwareVersion` uint16 overflow.** Deriving hardwareVersion from the
+  Roomba SKU (e.g. `j517020` → `517020`) overflowed Matter's uint16 limit
+  (65535) and caused matter.js to atomically reject the whole
+  BasicInformation override (silently reverting `softwareVersionString` /
+  `hardwareVersionString` back to matterbridge's defaults). `parse-
+  HardwareVersion` now extracts the digit after a letter prefix (j5 → 5)
+  and clamps to uint16.
+- **Robot MAC sourced from UDP discovery when MQTT omits it.** j-series
+  firmware doesn't publish the `mac` top-level field even after explicit
+  fetch. The UDP/5678 discovery probe reply always carries it; the
+  platform now harvests this metadata on startup unconditionally so it's
+  available for use even when ipAddress was configured manually.
+- **NetworkCommissioning(WiFi) command handlers spec-compliance.**
+  matter.js's default implementations of `scanNetworks`, `addOrUpdate-
+  WiFiNetwork`, `removeNetwork`, `connectNetwork`, and `reorderNetwork`
+  throw "unimplemented exception" — Matter §11.9 marks them mandatory
+  when the WiFi feature is declared, so the throws surfaced as
+  ValidatedElements warnings at startup and (suspected, never confirmed)
+  contributed to Apple Home subscription instability. Subclassed
+  `NetworkCommissioningServer.with(WiFiNetworkInterface)` on the fly with
+  read-only no-op responses (`NetworkIdNotFound` / `BoundsExceeded` /
+  `OtherConnectionFailure`) that the spec defines for exactly this case
+  ("device's Wi-Fi is managed out of band").
+- **`OperationCompletion` event no longer fires on running→idle**
+  transitions when the mission's last error was already cleared by
+  Roomba's clear-on-dock behavior. Latches the last non-zero error during
+  the mission so the completion event reports the actual failure cause.
+- **`ipAddress` mismatch warning.** When discovery finds a robot at an IP
+  different from the configured one, log a clear warning pointing at DHCP
+  renumbering as the likely cause.
+
+### Configuration toggles (added for bisection / opt-in features)
+
+- **`exposeRobotNetworkInfo`** (default `true`) — controls whether the
+  read-only `NetworkCommissioning(WiFi)` cluster is attached to the root
+  node. Affects HA's "Network name" (SSID) display.
+- **`overrideRobotNetworkInterfaces`** (default `false`) — replaces root
+  `GeneralDiagnostics.NetworkInterfaces` with a synthetic WiFi entry
+  carrying the Roomba's own MAC. Default off because faking the
+  hardware address tripped iOS Home's reachability checks during network
+  transitions; opt-in for users who want HA to show the robot's MAC.
+- **`useExtendedBasicInformation`** (default `false`) — gates the v1.7.0
+  BasicInformation extras (`partNumber`, `productLabel`, `serialNumber`)
+  on top of the v1.6.0 baseline. Bisection-friendly toggle for isolating
+  Apple Home regressions after upgrade.
+- **`disableRootCustomizations`** (default `false`) — debug kill-switch
+  that skips ALL root-node customizations (BasicInformation, Network-
+  Commissioning, GeneralDiagnostics). Use to verify whether an Apple
+  Home connectivity issue is caused by our root overrides or something
+  upstream.
+
 ### Documentation
 
 - README "Limitations we've chosen not to fix" section: MAC-address in
@@ -65,6 +130,11 @@ Focused release on controller metadata correctness + per-room progress.
   StartUp/ShutDown events not wired for `serverMode: false` users.
 - Highlights list updated with auto-IP, PROG, metadata accuracy entries.
 - Quick-start config example now omits `ipAddress`.
+- README documents the `softwareVersionString` / `hardwareVersionString`
+  matterbridge upstream limitation (those fields are hardcoded to
+  matterbridge's own version + host kernel string; the plugin's runtime
+  override applies in-memory but matterbridge's persisted-storage write
+  wins for what Apple Home reads at commission time).
 
 ## [1.6.0] — 2026-04-20
 
