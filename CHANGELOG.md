@@ -4,6 +4,37 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.1] — 2026-05-30
+
+Compatibility + correctness fix for Matter event firing. **Recommended for
+all users** — the event bugs below silently affect 1.7.0 on matterbridge
+3.7.10+ (operation-completion notifications never reach controllers).
+
+### Fixed
+
+- **Build break on matterbridge ≥ 3.9.** `triggerEvent`'s string-name
+  overload tightened its payload type to `Record<string, …>`, which the
+  named `ErrorStateStruct` (no index signature) no longer satisfies — CI
+  builds against `matterbridge@latest` (3.9.1) failed with TS2769 "No
+  overload matches this call" at the `operationalError` trigger.
+- **`operationalError` event double-fired / wrong payload.** matter.js's
+  `OperationalStateServer` already auto-emits the `operationalError` event
+  (with the spec payload `{ errorState }`) via its `operationalError$Changed`
+  reactor whenever the attribute is set. The plugin was *also* calling
+  `triggerEvent` manually with a bare struct payload — redundant, wrong
+  shape, and silently failing at runtime on newer matterbridge. Removed the
+  manual calls; `setAttribute` alone now drives the event correctly.
+- **`operationCompletion` event never fired.** It's an *optional* Matter
+  event (§7.4.8.2) and matter.js leaves optional events disabled unless
+  explicitly enabled — so `triggerEvent('rvcOperationalState',
+  'operationCompletion', …)` failed at runtime with "cluster not found on
+  endpoint" (observed on a j8 / Costco j7+ running matterbridge 3.7.10).
+  The `RoombaVacuumCleaner` subclass now overrides
+  `createDefaultRvcOperationalStateClusterServer` to re-require
+  `MatterbridgeRvcOperationalStateServer` (preserving pause/resume/goHome)
+  with `.enable({ events: { operationCompletion: true } })`, so the
+  "cleaning finished" notification actually reaches Apple Home / HA.
+
 ## [1.7.0] — 2026-05-29
 
 Focused release on controller metadata correctness + per-room progress.
@@ -283,6 +314,7 @@ workaround.
 Initial implementation. Exposes a single Roomba as a Matter RVC device with
 basic clean / pause / resume / dock commands and operational-state mapping.
 
+[1.7.1]: https://github.com/Rashed97/matterbridge-roomba/releases/tag/v1.7.1
 [1.7.0]: https://github.com/Rashed97/matterbridge-roomba/releases/tag/v1.7.0
 [1.6.0]: https://github.com/Rashed97/matterbridge-roomba/releases/tag/v1.6.0
 [1.4.0]: https://github.com/Rashed97/matterbridge-roomba/releases/tag/v1.4.0

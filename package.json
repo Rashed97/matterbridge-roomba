@@ -1,6 +1,6 @@
 {
   "name": "matterbridge-roomba",
-  "version": "1.7.0",
+  "version": "1.7.1",
   "description": "Matterbridge plugin for iRobot Roomba vacuum cleaners",
   "author": "Rashed97",
   "license": "Apache-2.0",
