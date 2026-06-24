@@ -3,7 +3,7 @@
  * Wraps the RoboticVacuumCleaner base class and handles command routing.
  */
 
-import { RoboticVacuumCleaner } from 'matterbridge/devices';
+import { RoboticVacuumCleaner, MatterbridgeRvcOperationalStateServer } from 'matterbridge/devices';
 import { MatterbridgeServiceAreaServer } from 'matterbridge';
 import { RvcRunMode, RvcCleanMode, RvcOperationalState, ServiceArea } from 'matterbridge/matter/clusters';
 import type { AnsiLogger } from 'matterbridge/logger';
@@ -47,6 +47,50 @@ class RoombaVacuumCleaner extends RoboticVacuumCleaner {
         // PROG initial state — empty until a mission starts. Matter spec
         // §1.17.6.5 requires this to be non-null when the feature is enabled.
         progress: [],
+      },
+    );
+    return this;
+  }
+
+  /**
+   * Override matterbridge's RvcOperationalState wiring to ENABLE the optional
+   * `operationCompletion` event (Matter 1.4 §7.4.8.2). matter.js leaves
+   * optional events disabled unless explicitly enabled, and matterbridge's
+   * `createDefaultRvcOperationalStateClusterServer` doesn't enable it — so a
+   * `triggerEvent('rvcOperationalState', 'operationCompletion', …)` call
+   * fails at runtime with "cluster … not found on endpoint" (the event isn't
+   * registered). We re-require the SAME `MatterbridgeRvcOperationalStateServer`
+   * (preserving its pause/resume/goHome command handling) but with the event
+   * enabled, so our "cleaning finished" notification actually fires.
+   *
+   * NOTE: we deliberately do NOT manually trigger the mandatory
+   * `operationalError` event — matter.js's OperationalStateServer auto-emits
+   * it (with the spec payload `{ errorState }`) whenever the
+   * `operationalError` attribute changes via setAttribute.
+   */
+  override createDefaultRvcOperationalStateClusterServer(
+    phaseList: (string[]) | null = null,
+    currentPhase: number | null = null,
+    operationalStateList?: RvcOperationalState.OperationalStateStruct[],
+    operationalState?: RvcOperationalState.OperationalState,
+    operationalError?: RvcOperationalState.ErrorStateStruct,
+  ): this {
+    this.behaviors.require(
+      MatterbridgeRvcOperationalStateServer.enable({ events: { operationCompletion: true } }),
+      {
+        phaseList,
+        currentPhase,
+        operationalStateList: operationalStateList ?? [
+          { operationalStateId: RvcOperationalState.OperationalState.Stopped },
+          { operationalStateId: RvcOperationalState.OperationalState.Running },
+          { operationalStateId: RvcOperationalState.OperationalState.Paused },
+          { operationalStateId: RvcOperationalState.OperationalState.Error },
+          { operationalStateId: RvcOperationalState.OperationalState.SeekingCharger },
+          { operationalStateId: RvcOperationalState.OperationalState.Charging },
+          { operationalStateId: RvcOperationalState.OperationalState.Docked },
+        ],
+        operationalState: operationalState ?? RvcOperationalState.OperationalState.Docked,
+        operationalError: operationalError ?? { errorStateId: RvcOperationalState.ErrorState.NoError, errorStateDetails: 'Fully operational' },
       },
     );
     return this;
@@ -971,12 +1015,15 @@ export class RoombaDevice {
         this.log.error(
           `Cannot start mop/combo clean: ${mopGuard.statusText} (Matter errorStateId=${mopGuard.errorStateId})`,
         );
-        // Surface the error state + event before throwing so Apple Home
-        // shows the right icon/notification rather than a generic failure.
+        // Surface the error state before throwing so Apple Home shows the
+        // right icon/notification rather than a generic failure. Setting the
+        // attribute is enough — matter.js's OperationalStateServer auto-emits
+        // the `operationalError` event (payload `{ errorState }`) on the
+        // attribute change, so we must NOT also trigger it manually (double
+        // event + wrong payload shape).
         try {
           const payload = { errorStateId: mopGuard.errorStateId, errorStateLabel: mopGuard.statusText };
           this.device.setAttribute('rvcOperationalState', 'operationalError', payload, this.log);
-          await this.device.triggerEvent('rvcOperationalState', 'operationalError', payload, this.log);
         } catch (err) {
           this.log.debug(`Pre-run mop-guard error surfacing failed: ${err}`);
         }
@@ -1418,13 +1465,17 @@ export class RoombaDevice {
       });
       if (status.tankLevel > 0) this.robotHasSeenTank = true;
       if (errorState.errorStateId !== this.lastPushed.errorStateId) {
+        // Setting the attribute is sufficient — matter.js's
+        // OperationalStateServer reacts to the `operationalError` attribute
+        // change and auto-emits the `operationalError` event (with the
+        // spec-correct `{ errorState }` payload) to all subscribers. We used
+        // to also call triggerEvent here, but that double-fired the event AND
+        // passed the wrong payload shape (bare struct instead of
+        // `{ errorState }`), which silently failed at runtime on newer
+        // matterbridge ("cluster not found" — the manual path bypasses the
+        // reactor) and broke the type-check on matterbridge ≥ 3.9.
         this.device.setAttribute('rvcOperationalState', 'operationalError', errorState, this.log);
-        // Also fire the Matter event so event-based subscribers (Apple Home
-        // notifications, HA automations) get a push for the transition.
         if (errorState.errorStateId !== RvcOperationalState.ErrorState.NoError) {
-          this.device
-            .triggerEvent('rvcOperationalState', 'operationalError', errorState, this.log)
-            .catch((err) => this.log.debug(`triggerEvent operationalError failed: ${err}`));
           this.log.info(
             `Robot error transition: id=${errorState.errorStateId} (Roomba errorCode=${status.errorCode}, binFull=${status.binFull}, tankLevel=${status.tankLevel})`,
           );
